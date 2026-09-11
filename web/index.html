@@ -1,7 +1,14 @@
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+/>
+<meta name="color-scheme" content="dark light" />
 <title>XCTrack Get Home</title>
 <style>
+  /* The widget fills the XCTrack web-page widget exactly: no scrollbars, no
+     rubber-banding, no text selection on a long press. The SVG paints its own
+     background, so these colours only cover the moment before the first render. */
   html,
   body {
     margin: 0;
@@ -9,14 +16,33 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
+    overscroll-behavior: none;
     background: #000;
     color: #fff;
-    font-family: system-ui, sans-serif;
+    font-family: "SBB", "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  html[data-theme="light"],
+  html[data-theme="light"] body {
+    background: #fff;
+    color: #000;
+  }
+  body {
+    user-select: none;
+    -webkit-user-select: none;
   }
   #app {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+  #app > svg {
+    display: block;
     width: 100%;
     height: 100%;
   }
 </style>
-<div id="app">hello world</div>
+<div id="app"></div>
 <script type="module" src="/src/main.ts"></script>

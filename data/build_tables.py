@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Build web/public/data/tables/<homeId>.bin — offline travel-time tables (Phase 2).
+
+For every home station in ``homes.txt`` the widget gets one table: the median
+door-to-home travel time, including the initial wait, from *every* stop in
+``stops.json.gz``, for three day types and sixteen departure hours. With the
+table cached the widget can rank stops with no network at all.
+
+Pipeline: Swiss GTFS (opentransportdata.swiss permalink) + a Switzerland OSM
+extract (Geofabrik, cropped with ``osmium`` when available) -> an R5 transport
+network via r5py -> one ``r5py.TravelTimeMatrix`` per (day type, hour, batch of
+homes), origins = all stops, destinations = the homes.
+
+Binary format (must match web/src/table.ts) — 32-byte little-endian header:
+
+    magic "XSBT" (4) | version u8 = 1 | dayTypes u8 = 3 | hourStart u8 = 6
+    | hourCount u8 = 16 | stopCount u32 | homeId u32 | buildId 16 bytes ASCII
+
+followed by ``u16 minutes[dayType][hour][stopIdx]``, 65535 = unreachable.
+``stopIdx`` is the position in ``stops.json.gz`` (sorted by id), which is why
+the table carries the ``buildId`` of the ``meta.json`` it was built against:
+a widget that sees a different id must ignore the table.
+
+Runtime is the hard part — see data/README.md. The run is resumable per home
+and per day type (checkpoints under ``cache/tables/<buildId>/``), takes a
+``--time-budget-min``, and is meant to be tiered with ``--homes-limit``,
+``--hours`` and ``--day-types`` until the whole set fits the CI budget.
+
+Usage:
+    uv run --group tables build_tables.py --selftest        # no r5py, no data
+    uv run --group tables build_tables.py                   # full build
+    uv run --group tables build_tables.py --homes-limit 10 --day-types 1 \\
+        --hours 12-15 --time-budget-min 60
+    JAVA_TOOL_OPTIONS=-Xmx6g uv run --group tables build_tables.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import gzip
+import json
+import logging
+import os
+import random
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+import numpy as np
+
+from build_homes import CH_BBOX, read_homes
+
+DATA_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = DATA_DIR / "downloads"
+CACHE_DIR = DATA_DIR / "cache" / "tables"
+HOMES_PATH = DATA_DIR / "homes.txt"
+WEB_DATA_DIR = DATA_DIR.parent / "web" / "public" / "data"
+STOPS_PATH = WEB_DATA_DIR / "stops.json.gz"
+META_PATH = WEB_DATA_DIR / "meta.json"
+OUT_DIR = WEB_DATA_DIR / "tables"
+
+# Permalink for the current timetable year; it always redirects to the newest
+# gtfs_fp20xx_<date>.zip and needs no API key. The cookbook lists the sibling
+# datasets timetable-2027-gtfs2020 and timetable-draft-gtfs.
+GTFS_URL = "https://data.opentransportdata.swiss/dataset/timetable-2026-gtfs2020/permalink"
+OSM_URL = "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf"
+
+# Binary format — keep in lockstep with web/src/table.ts.
+MAGIC = b"XSBT"
+VERSION = 1
+DAY_TYPES = 3  # 0 = Mon-Fri, 1 = Sat, 2 = Sun/holiday
+HOUR_START = 6
+HOUR_COUNT = 16  # 06:00 .. 21:00
+UNREACHABLE = 65535
+MAX_MINUTES = UNREACHABLE - 1
+HEADER_STRUCT = struct.Struct("<4sBBBBII16s")
+BUILD_ID_BYTES = 16
+
+# Weekday each day type is sampled on.
+DAY_TYPE_WEEKDAY = {0: 0, 1: 5, 2: 6}  # Monday, Saturday, Sunday
+DAY_TYPE_NAMES = {0: "Mon-Fri", 1: "Sat", 2: "Sun/holiday"}
+
+log = logging.getLogger("build_tables")
+
+
+# --------------------------------------------------------------------------
+# binary format
+# --------------------------------------------------------------------------
+
+
+def build_id_field(build_id: str) -> bytes:
+    """The header's 16-byte buildId field: ASCII, truncated, NUL-padded.
+
+    ``meta.json`` currently carries a 19-character id (``2026-09-11-4b9110db``:
+    date plus eight hex digits of the stops hash), which does not fit the
+    32-byte header. The field therefore holds the first 16 characters and the
+    widget must compare against ``meta.buildId.slice(0, 16)``. That still
+    changes whenever the stop list changes, which is the whole point of the
+    check — the table indexes stops by position.
+    """
+    return build_id.encode("ascii")[:BUILD_ID_BYTES].ljust(BUILD_ID_BYTES, b"\0")
+
+
+def encode_table(home_id: int, build_id: str, minutes: np.ndarray) -> bytes:
+    """Serialise one home's table.
+
+    ``minutes`` must have shape ``(DAY_TYPES, HOUR_COUNT, stopCount)``; values
+    are clamped into ``[0, 65534]``, and 65535 is passed through as the
+    unreachable marker.
+    """
+    if minutes.shape[:2] != (DAY_TYPES, HOUR_COUNT):
+        raise ValueError(f"expected shape ({DAY_TYPES}, {HOUR_COUNT}, n), got {minutes.shape}")
+    build_id_bytes = build_id_field(build_id)
+    stop_count = int(minutes.shape[2])
+    header = HEADER_STRUCT.pack(
+        MAGIC,
+        VERSION,
+        DAY_TYPES,
+        HOUR_START,
+        HOUR_COUNT,
+        stop_count,
+        home_id,
+        build_id_bytes,
+    )
+    body = np.ascontiguousarray(minutes, dtype="<u2")
+    return header + body.tobytes()
+
+
+def minutes_from_travel_times(values: np.ndarray) -> np.ndarray:
+    """Round float minutes (NaN = no connection) into the table's uint16 domain."""
+    out = np.full(values.shape, UNREACHABLE, dtype=np.uint16)
+    finite = np.isfinite(values)
+    rounded = np.rint(np.where(finite, values, 0.0))
+    out[finite] = np.clip(rounded[finite], 0, MAX_MINUTES).astype(np.uint16)
+    return out
+
+
+# --------------------------------------------------------------------------
+# inputs
+# --------------------------------------------------------------------------
+
+
+def download(url: str, dest: Path, refresh: bool) -> Path:
+    if dest.exists() and not refresh:
+        log.info("using cached %s (%.0f MB)", dest.name, dest.stat().st_size / 1e6)
+        return dest
+    import requests
+
+    log.info("downloading %s", url)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
+        with tmp.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                fh.write(chunk)
+    tmp.replace(dest)
+    log.info("downloaded %.0f MB to %s", dest.stat().st_size / 1e6, dest)
+    return dest
+
+
+def crop_osm(pbf: Path, cropped: Path, refresh: bool) -> Path:
+    """Cut the OSM extract down to the Swiss bounding box, if osmium is installed.
+
+    R5 builds its street layer from every way in the file, so trimming the
+    Geofabrik extract (which overshoots the border) is the cheapest memory win
+    available. Without ``osmium`` the uncropped file still works.
+    """
+    if cropped.exists() and not refresh:
+        log.info("using cached %s (%.0f MB)", cropped.name, cropped.stat().st_size / 1e6)
+        return cropped
+    if shutil.which("osmium") is None:
+        log.warning("osmium not found — routing on the uncropped %s", pbf.name)
+        return pbf
+    lat_min, lat_max, lon_min, lon_max = CH_BBOX
+    bbox = f"{lon_min},{lat_min},{lon_max},{lat_max}"
+    log.info("cropping %s to %s", pbf.name, bbox)
+    subprocess.run(
+        ["osmium", "extract", "--bbox", bbox, "--strategy", "complete_ways",
+         "--overwrite", "-o", str(cropped), str(pbf)],
+        check=True,
+    )
+    log.info("cropped to %.0f MB", cropped.stat().st_size / 1e6)
+    return cropped
+
+
+def file_digest(path: Path, length: int = 8) -> str:
+    """Short content hash, used to tie checkpoints to the GTFS they came from."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:length]
+
+
+def load_stops() -> list[dict]:
+    with gzip.open(STOPS_PATH, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def load_build_id() -> str:
+    return json.loads(META_PATH.read_text(encoding="utf-8"))["buildId"]
+
+
+# --------------------------------------------------------------------------
+# representative dates
+# --------------------------------------------------------------------------
+
+
+def easter(year: int) -> dt.date:
+    """Gregorian Easter Sunday (anonymous computus)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    ll = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ll) // 451
+    month = (h + ll - 7 * m + 114) // 31
+    day = ((h + ll - 7 * m + 114) % 31) + 1
+    return dt.date(year, month, day)
+
+
+def ch_holidays(year: int) -> set[dt.date]:
+    """Swiss national holidays, plus the days most cantons also close.
+
+    Not exhaustive (cantonal holidays vary), but enough to keep a "typical
+    weekday" sample off a day the timetable runs a Sunday service on.
+    """
+    e = easter(year)
+    return {
+        dt.date(year, 1, 1),
+        dt.date(year, 1, 2),
+        e - dt.timedelta(days=2),  # Good Friday
+        e + dt.timedelta(days=1),  # Easter Monday
+        e + dt.timedelta(days=39),  # Ascension
+        e + dt.timedelta(days=50),  # Whit Monday
+        dt.date(year, 8, 1),
+        dt.date(year, 12, 24),
+        dt.date(year, 12, 25),
+        dt.date(year, 12, 26),
+        dt.date(year, 12, 31),
+    }
+
+
+def _is_blackout(day: dt.date) -> bool:
+    if day in ch_holidays(day.year):
+        return True
+    # Christmas / New Year fortnight: reduced and special services everywhere.
+    return (day.month, day.day) >= (12, 20) or (day.month, day.day) <= (1, 6)
+
+
+def gtfs_validity(gtfs_zip: Path) -> tuple[dt.date, dt.date]:
+    """Overall service window of the feed, from calendar.txt / calendar_dates.txt."""
+    import csv
+    import io
+
+    def rows(zf: zipfile.ZipFile, name: str):
+        with zf.open(name) as raw:
+            yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
+
+    stamps: list[str] = []
+    with zipfile.ZipFile(gtfs_zip) as zf:
+        names = set(zf.namelist())
+        if "calendar.txt" in names:
+            for row in rows(zf, "calendar.txt"):
+                stamps += [row["start_date"], row["end_date"]]
+        elif "calendar_dates.txt" in names:
+            stamps += [row["date"] for row in rows(zf, "calendar_dates.txt")]
+    if not stamps:
+        raise RuntimeError(f"{gtfs_zip} has neither calendar.txt nor calendar_dates.txt")
+    to_date = lambda s: dt.datetime.strptime(s, "%Y%m%d").date()  # noqa: E731
+    return to_date(min(stamps)), to_date(max(stamps))
+
+
+def pick_dates(
+    valid_from: dt.date, valid_to: dt.date, today: dt.date, day_types: list[int]
+) -> dict[int, dt.date]:
+    """One representative date per day type: the first non-blackout match at
+    least a week out, clamped into the feed's validity window."""
+    start = max(valid_from, today + dt.timedelta(days=7))
+    if start > valid_to:
+        start = valid_from
+    dates: dict[int, dt.date] = {}
+    for day_type in day_types:
+        weekday = DAY_TYPE_WEEKDAY[day_type]
+        day = start + dt.timedelta(days=(weekday - start.weekday()) % 7)
+        while day <= valid_to and _is_blackout(day):
+            day += dt.timedelta(days=7)
+        if day > valid_to:
+            raise RuntimeError(
+                f"no usable {DAY_TYPE_NAMES[day_type]} date in {valid_from}..{valid_to}"
+            )
+        dates[day_type] = day
+    return dates
+
+
+# --------------------------------------------------------------------------
+# routing
+# --------------------------------------------------------------------------
+
+
+def build_network(osm_pbf: Path, gtfs_zip: Path):
+    from r5py import TransportNetwork
+
+    log.info("building R5 network from %s + %s (several minutes)", osm_pbf.name, gtfs_zip.name)
+    started = time.monotonic()
+    network = TransportNetwork(str(osm_pbf), [str(gtfs_zip)])
+    log.info("network built in %.0f s", time.monotonic() - started)
+    return network
+
+
+def points_frame(stops: list[dict]):
+    import geopandas
+    import shapely
+
+    return geopandas.GeoDataFrame(
+        {"id": [str(s["id"]) for s in stops]},
+        geometry=[shapely.Point(s["lon"], s["lat"]) for s in stops],
+        crs="EPSG:4326",
+    )
+
+
+def travel_times(
+    network,
+    origins,
+    destinations,
+    departure: dt.datetime,
+    window_min: int,
+    max_time_min: int,
+) -> np.ndarray:
+    """Median travel time in minutes, shape (len(origins), len(destinations)).
+
+    ``departure_time_window`` makes R5 depart every minute of the window and
+    report the median over those departures, so the returned time includes the
+    typical wait for the next service. Unreachable pairs come back as NaN.
+    """
+    from r5py import TransportMode, TravelTimeMatrix
+
+    import pandas
+
+    matrix = TravelTimeMatrix(
+        network,
+        origins=origins,
+        destinations=destinations,
+        transport_modes=[TransportMode.TRANSIT],
+        departure=departure,
+        departure_time_window=dt.timedelta(minutes=window_min),
+        max_time=dt.timedelta(minutes=max_time_min),
+        percentiles=[50],
+        snap_to_network=True,
+    )
+    # Step out of the r5py/geopandas subclass before reshaping.
+    long = pandas.DataFrame(matrix)[["from_id", "to_id", "travel_time"]]
+    wide = long.pivot(index="from_id", columns="to_id", values="travel_time").reindex(
+        index=origins["id"], columns=destinations["id"]
+    )
+    return wide.to_numpy(dtype=float)
+
+
+# --------------------------------------------------------------------------
+# checkpoints
+# --------------------------------------------------------------------------
+
+
+def checkpoint_path(root: Path, home_id: int, day_type: int) -> Path:
+    return root / f"{home_id}_d{day_type}.npz"
+
+
+def checkpoint_hours(path: Path) -> set[int]:
+    """Hours already computed in a checkpoint, without decompressing the data.
+
+    ``numpy`` decompresses npz members lazily, so this reads the tiny ``hours``
+    array only — cheap enough to call once per (home, day type) at startup.
+    """
+    if not path.exists():
+        return set()
+    try:
+        with np.load(path) as npz:
+            return {int(h) for h in npz["hours"]}
+    except (OSError, ValueError, KeyError):
+        return set()
+
+
+def load_checkpoint(path: Path, stop_count: int) -> dict[int, np.ndarray]:
+    """Hour -> minutes array, for the hours already computed."""
+    if not path.exists():
+        return {}
+    try:
+        with np.load(path) as npz:
+            hours, minutes = npz["hours"], npz["minutes"]
+    except (OSError, ValueError, KeyError) as exc:
+        log.warning("ignoring unreadable checkpoint %s (%s)", path.name, exc)
+        return {}
+    if minutes.shape[1] != stop_count:
+        log.warning("ignoring checkpoint %s: %d stops, expected %d",
+                    path.name, minutes.shape[1], stop_count)
+        return {}
+    return {int(h): minutes[i] for i, h in enumerate(hours)}
+
+
+def save_checkpoint(path: Path, by_hour: dict[int, np.ndarray], date: dt.date) -> None:
+    hours = sorted(by_hour)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".npz.part")
+    # Write through a handle: np.savez_compressed would append ".npz" to a path.
+    with tmp.open("wb") as fh:
+        np.savez_compressed(
+            fh,
+            hours=np.array(hours, dtype=np.int16),
+            minutes=np.stack([by_hour[h] for h in hours]).astype(np.uint16),
+            date=np.array(date.isoformat()),
+        )
+    tmp.replace(path)
+
+
+# --------------------------------------------------------------------------
+# driver
+# --------------------------------------------------------------------------
+
+
+def parse_hours(spec: str) -> list[int]:
+    """``"6-21"``, ``"6,12,18"`` or a mix, clamped to the header's hour range."""
+    hours: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = (int(x) for x in part.split("-", 1))
+            hours += list(range(lo, hi + 1))
+        else:
+            hours.append(int(part))
+    hours = sorted({h for h in hours if HOUR_START <= h < HOUR_START + HOUR_COUNT})
+    if not hours:
+        raise ValueError(f"no hour in {HOUR_START}..{HOUR_START + HOUR_COUNT - 1} in {spec!r}")
+    return hours
+
+
+def write_tables(
+    out_dir: Path, root: Path, homes: list[int], build_id: str, stop_count: int
+) -> int:
+    """Assemble every checkpoint for each home into one .bin. Missing day types
+    and hours are written as unreachable, so a partial (tiered) build still
+    produces a table the widget can use."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for home_id in homes:
+        minutes = np.full((DAY_TYPES, HOUR_COUNT, stop_count), UNREACHABLE, dtype=np.uint16)
+        filled = 0
+        for day_type in range(DAY_TYPES):
+            for hour, values in load_checkpoint(checkpoint_path(root, home_id, day_type), stop_count).items():
+                minutes[day_type, hour - HOUR_START] = values
+                filled += 1
+        if filled == 0:
+            log.warning("home %d has no computed cell — skipping", home_id)
+            continue
+        (out_dir / f"{home_id}.bin").write_bytes(encode_table(home_id, build_id, minutes))
+        written += 1
+        if filled < DAY_TYPES * HOUR_COUNT:
+            log.info("home %d: %d/%d cells computed", home_id, filled, DAY_TYPES * HOUR_COUNT)
+    log.info("wrote %d tables to %s", written, out_dir)
+    return written
+
+
+def selftest(out_dir: Path, stop_count: int = 500, seed: int = 7) -> int:
+    """Write, then re-read, a small random table — exercises the binary format
+    end to end without r5py, a network, or any downloaded input."""
+    rng = random.Random(seed)
+    build_id = "2026-09-11-deadbeef"
+    home_id = 8503000
+    minutes = np.array(
+        [rng.choice([rng.randrange(0, 300), UNREACHABLE]) for _ in range(DAY_TYPES * HOUR_COUNT * stop_count)],
+        dtype=np.uint16,
+    ).reshape(DAY_TYPES, HOUR_COUNT, stop_count)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{home_id}.bin"
+    path.write_bytes(encode_table(home_id, build_id, minutes))
+
+    blob = path.read_bytes()
+    magic, version, day_types, hour_start, hour_count, count, hid, bid = HEADER_STRUCT.unpack_from(blob)
+    assert magic == MAGIC, magic
+    assert (version, day_types, hour_start, hour_count) == (VERSION, DAY_TYPES, HOUR_START, HOUR_COUNT)
+    assert count == stop_count and hid == home_id
+    assert bid.rstrip(b"\0").decode("ascii") == build_id[:BUILD_ID_BYTES]
+    body = np.frombuffer(blob, dtype="<u2", offset=HEADER_STRUCT.size)
+    assert len(blob) == HEADER_STRUCT.size + 2 * DAY_TYPES * HOUR_COUNT * stop_count, len(blob)
+    assert np.array_equal(body.reshape(minutes.shape), minutes)
+    log.info("selftest OK: %s, %d bytes, round-trip exact", path, len(blob))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--out-dir", type=Path, help=f"where the .bin files go (default {OUT_DIR})")
+    parser.add_argument("--homes", type=Path, default=HOMES_PATH, help="homes.txt path")
+    parser.add_argument("--homes-limit", type=int, help="only the first N homes (tiering)")
+    parser.add_argument("--hours", default=f"{HOUR_START}-{HOUR_START + HOUR_COUNT - 1}",
+                        help="departure hours, e.g. '6-21' or '9,12,15'")
+    parser.add_argument("--day-types", default="0,1,2",
+                        help="day types to compute: 0 = Mon-Fri, 1 = Sat, 2 = Sun/holiday")
+    parser.add_argument("--home-batch", type=int, default=100,
+                        help="homes per r5py call; R5 reaches all destinations in "
+                             "one search per origin, so a bigger batch is nearly "
+                             "free in time and costs only result-frame memory")
+    parser.add_argument("--departure-window-min", type=int, default=60,
+                        help="departure window R5 takes the median over")
+    parser.add_argument("--max-time-min", type=int, default=180, help="routing cut-off")
+    parser.add_argument("--time-budget-min", type=float,
+                        help="stop cleanly after this many minutes (checkpoints are kept)")
+    parser.add_argument("--gtfs", type=Path, default=DOWNLOAD_DIR / "gtfs_ch.zip")
+    parser.add_argument("--osm", type=Path, default=DOWNLOAD_DIR / "switzerland-latest.osm.pbf")
+    parser.add_argument("--refresh", action="store_true", help="re-download GTFS and OSM")
+    parser.add_argument("--max-memory", help="passed to r5py, e.g. '6G' or '80%%'")
+    parser.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today(),
+                        help="reference date for picking representative days")
+    parser.add_argument("--selftest", action="store_true",
+                        help="write and verify a tiny random table; no r5py, no downloads")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if args.selftest:
+        # Never scribble a fake table over a real one.
+        return selftest(args.out_dir or CACHE_DIR / "selftest")
+    out_dir = args.out_dir or OUT_DIR
+
+    if args.max_memory:
+        # r5py reads its own arguments off sys.argv at import time.
+        sys.argv += ["--max-memory", args.max_memory]
+    if "JAVA_TOOL_OPTIONS" not in os.environ:
+        log.info("JAVA_TOOL_OPTIONS is unset; r5py will grant the JVM up to 80% of RAM")
+
+    started = time.monotonic()
+    deadline = started + args.time_budget_min * 60 if args.time_budget_min else None
+
+    hours = parse_hours(args.hours)
+    day_types = sorted({int(d) for d in args.day_types.split(",") if d.strip() != ""})
+    if any(d not in DAY_TYPE_WEEKDAY for d in day_types):
+        parser.error(f"--day-types must be a subset of {sorted(DAY_TYPE_WEEKDAY)}")
+
+    stops = load_stops()
+    build_id = load_build_id()
+    homes = read_homes(args.homes)
+    known = {s["id"] for s in stops}
+    unknown = [h for h in homes if h not in known]
+    if unknown:
+        log.warning("%d homes are not in stops.json.gz and are dropped: %s", len(unknown), unknown[:10])
+        homes = [h for h in homes if h in known]
+    if args.homes_limit:
+        homes = homes[: args.homes_limit]
+    log.info("buildId %s: %d stops, %d homes, day types %s, hours %s",
+             build_id, len(stops), len(homes), day_types, hours)
+
+    gtfs = download(GTFS_URL, args.gtfs, args.refresh)
+    osm = download(OSM_URL, args.osm, args.refresh)
+    osm = crop_osm(osm, args.osm.with_name("switzerland-ch-bbox.osm.pbf"), args.refresh)
+
+    valid_from, valid_to = gtfs_validity(gtfs)
+    dates = pick_dates(valid_from, valid_to, args.today, day_types)
+    log.info("GTFS valid %s..%s; sampling %s", valid_from, valid_to,
+             {DAY_TYPE_NAMES[d]: dates[d].isoformat() for d in day_types})
+
+    # Checkpoints are only valid for one (stop list, timetable) pair: the stop
+    # list fixes the index, the timetable fixes the numbers.
+    root = CACHE_DIR / f"{build_id}-{file_digest(gtfs)}"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "dates.json").write_text(
+        json.dumps({DAY_TYPE_NAMES[d]: dates[d].isoformat() for d in day_types}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    by_id = {s["id"]: s for s in stops}
+    done = {
+        (home, d): checkpoint_hours(checkpoint_path(root, home, d))
+        for home in homes
+        for d in day_types
+    }
+    batches = [homes[i : i + args.home_batch] for i in range(0, len(homes), args.home_batch)]
+    todo = [
+        (d, h, batch)
+        for d in day_types
+        for batch in batches
+        for h in hours
+        if any(h not in done[(home, d)] for home in batch)
+    ]
+    budget_hit = False
+    if not todo:
+        log.info("every requested cell is already checkpointed")
+    else:
+        network = build_network(osm, gtfs)
+        origins = points_frame(stops)
+        for day_type, hour, batch in todo:
+            if deadline and time.monotonic() > deadline:
+                log.warning("time budget reached — stopping with checkpoints intact")
+                budget_hit = True
+                break
+            pending = [home for home in batch if hour not in done[(home, day_type)]]
+            if not pending:
+                continue
+            departure = dt.datetime.combine(dates[day_type], dt.time(hour, 0))
+            cell_started = time.monotonic()
+            values = travel_times(
+                network,
+                origins,
+                points_frame([by_id[h] for h in pending]),
+                departure,
+                args.departure_window_min,
+                args.max_time_min,
+            )
+            minutes = minutes_from_travel_times(values)
+            for column, home in enumerate(pending):
+                path = checkpoint_path(root, home, day_type)
+                by_hour = load_checkpoint(path, len(stops))
+                by_hour[hour] = minutes[:, column]
+                save_checkpoint(path, by_hour, dates[day_type])
+                done[(home, day_type)].add(hour)
+            log.info(
+                "%s %02d:00, %d homes: %.0f s, %.1f%% reachable",
+                DAY_TYPE_NAMES[day_type], hour, len(pending),
+                time.monotonic() - cell_started,
+                100.0 * np.mean(minutes != UNREACHABLE),
+            )
+
+    written = write_tables(out_dir, root, homes, build_id, len(stops))
+    log.info("done in %.1f min; %d tables", (time.monotonic() - started) / 60, written)
+    if budget_hit:
+        log.warning("build is INCOMPLETE — re-run with the same cache to continue")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

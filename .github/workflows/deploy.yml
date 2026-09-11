@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # to fetch the tables artifact from tables.yml
   pages: write
   id-token: write
 
@@ -25,6 +26,24 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      # Phase 2 tables are ~1 GB of binaries, so they are never committed:
+      # tables.yml publishes them as an artifact and the site build pulls the
+      # newest successful one in. Before the first tables run there is nothing
+      # to download, and the widget falls back to its travel-time heuristic.
+      - name: Fetch travel-time tables
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: tables.yml
+          workflow_conclusion: success
+          name: tables
+          path: web/public/data/tables
+          if_no_artifact_found: warn
+
+      - name: Report tables
+        run: |
+          count=$(ls web/public/data/tables 2>/dev/null | wc -l)
+          echo "travel-time tables bundled: $count" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install dependencies
         working-directory: web

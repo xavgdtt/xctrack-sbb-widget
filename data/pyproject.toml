@@ -14,3 +14,9 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+# `tables` is optional on purpose: build_stops.py must stay installable without
+# a JVM. r5py pulls in jpype1 + geopandas and needs Java 21 on PATH.
+[dependency-groups]
+dev = ["pytest>=8.0"]
+tables = ["r5py>=1.1,<2", "geopandas>=1.0", "shapely>=2.0"]

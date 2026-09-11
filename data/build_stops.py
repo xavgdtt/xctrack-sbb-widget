@@ -335,6 +335,10 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, dem_used: bool) -> tuple[int,
         with gzip.GzipFile(fileobj=fh, mode="wb", compresslevel=9, mtime=0) as gz:
             gz.write(payload)
 
+    # Uncompressed twin, byte-for-byte the same JSON: stops.ts falls back to it
+    # where the WebView has no DecompressionStream.
+    (out_dir / "stops.json").write_bytes(payload)
+
     now = dt.datetime.now(dt.timezone.utc)
     build_id = f"{now.date().isoformat()}-{digest[:8]}"
     meta = {

@@ -1,0 +1,112 @@
+name: Travel-time tables
+
+# Monthly rebuild of web/public/data/tables/<homeId>.bin (Phase 2).
+#
+# The tables are never committed: this workflow publishes them as an artifact
+# named "tables", and deploy.yml downloads the newest successful one before it
+# builds the site. A run that hits its time budget still uploads what it has,
+# and the next run resumes from the cached checkpoints.
+
+on:
+  schedule:
+    - cron: "17 3 1 * *" # 03:17 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      homes_limit:
+        description: "Only the first N homes (blank = all of homes.txt)"
+        required: false
+      day_types:
+        description: "Day types to compute (0 = Mon-Fri, 1 = Sat, 2 = Sun)"
+        default: "0,1,2"
+      hours:
+        description: "Departure hours, e.g. 6-21 or 9,12,15"
+        default: "6-21"
+      time_budget_min:
+        description: "Stop cleanly after this many minutes"
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tables
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      # R5 is memory-hungry; the runner has 16 GB, and r5py would otherwise
+      # take 80% of it and leave too little for the JVM's own overhead.
+      JAVA_TOOL_OPTIONS: -Xmx6g
+      DAY_TYPES: ${{ inputs.day_types || '0,1,2' }}
+      HOURS: ${{ inputs.hours || '6-21' }}
+      TIME_BUDGET_MIN: ${{ inputs.time_budget_min || '300' }}
+      HOMES_LIMIT: ${{ inputs.homes_limit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: data/uv.lock
+
+      - name: Install osmium-tool
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends osmium-tool
+
+      - name: Cache key stamps
+        id: stamp
+        run: |
+          echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+          echo "stops=$(sha256sum web/public/data/stops.json.gz | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # GTFS zip (~250 MB), Geofabrik PBF (~400 MB), the cropped PBF and the R5
+      # network R5 writes next to it. Refreshed monthly by the key.
+      - name: Cache GTFS / OSM / R5 network
+        uses: actions/cache@v4
+        with:
+          path: data/downloads
+          key: tables-inputs-${{ steps.stamp.outputs.month }}
+          restore-keys: tables-inputs-
+
+      # Per-(home, day type) checkpoints, so a run that runs out of budget is
+      # picked up by the next one. The key is unique per run so every run saves
+      # a new entry; restore-keys pulls the most recent matching one.
+      - name: Cache travel-time checkpoints
+        uses: actions/cache@v4
+        with:
+          path: data/cache/tables
+          key: tables-ckpt-${{ steps.stamp.outputs.stops }}-${{ github.run_id }}
+          restore-keys: tables-ckpt-${{ steps.stamp.outputs.stops }}-
+
+      - name: Build tables
+        working-directory: data
+        run: |
+          uv run --group tables build_tables.py \
+            --day-types "$DAY_TYPES" \
+            --hours "$HOURS" \
+            --time-budget-min "$TIME_BUDGET_MIN" \
+            ${HOMES_LIMIT:+--homes-limit "$HOMES_LIMIT"}
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Travel-time tables"
+            echo
+            echo "- tables: $(ls web/public/data/tables | wc -l)"
+            echo "- total size: $(du -sh web/public/data/tables | cut -f1)"
+            echo "- day types: \`$DAY_TYPES\`, hours: \`$HOURS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tables
+          path: web/public/data/tables
+          if-no-files-found: error
+          retention-days: 90

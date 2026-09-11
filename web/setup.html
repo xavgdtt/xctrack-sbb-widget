@@ -1,16 +1,160 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>XCTrack Get Home — Setup</title>
-<style>
-  html,
-  body {
-    margin: 0;
-    padding: 0;
-    font-family: system-ui, sans-serif;
-  }
-  #app {
-    padding: 16px;
-  }
-</style>
-<div id="app">hello world</div>
+<link rel="stylesheet" href="/src/setup.css" />
+<div id="app">
+  <h1>XCTrack Get Home — Setup</h1>
+  <p class="subtitle">
+    Configure your home station and glide settings, then add the widget URL to XCTrack.
+  </p>
+
+  <section>
+    <h2>Home station</h2>
+    <div class="field">
+      <label for="home-search">Search for your home station</label>
+      <span class="help">Start typing a Swiss station name.</span>
+      <div class="search-wrap">
+        <input
+          id="home-search"
+          type="search"
+          autocomplete="off"
+          placeholder="e.g. Interlaken Ost"
+          aria-expanded="false"
+          aria-controls="home-results"
+        />
+        <ul id="home-results" class="search-results" role="listbox"></ul>
+      </div>
+      <div id="home-search-status" class="search-status" aria-live="polite"></div>
+      <div id="selected-home" class="selected-home" hidden></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Flight &amp; glide settings</h2>
+    <div class="grid-2">
+      <div class="field">
+        <label for="cfg-v">Trim speed (km/h)</label>
+        <span class="help">Your typical hands-off trim airspeed.</span>
+        <input id="cfg-v" type="number" min="1" step="1" />
+      </div>
+      <div class="field">
+        <label for="cfg-lmax">Max glide ratio</label>
+        <span class="help">Ignore stops that need a glide ratio above this.</span>
+        <input id="cfg-lmax" type="number" min="1" step="0.5" />
+      </div>
+      <div class="field">
+        <label for="cfg-lsafe">Safe glide ratio</label>
+        <span class="help">Threshold for the SAFEST pick and the red/amber/green coloring.</span>
+        <input id="cfg-lsafe" type="number" min="1" step="0.5" />
+      </div>
+      <div class="field">
+        <label for="cfg-margin">Safety margin (m)</label>
+        <span class="help">Height subtracted from your altitude before the glide calc.</span>
+        <input id="cfg-margin" type="number" min="0" step="10" />
+      </div>
+      <div class="field">
+        <label for="cfg-pack">Packing time (min)</label>
+        <span class="help">Minutes to pack up after landing, before walking.</span>
+        <input id="cfg-pack" type="number" min="0" step="1" />
+      </div>
+      <div class="field">
+        <label for="cfg-walk">Walk to stop (min)</label>
+        <span class="help">Minutes to walk from a typical landing spot to the stop.</span>
+        <input id="cfg-walk" type="number" min="0" step="1" />
+      </div>
+      <div class="field">
+        <label for="cfg-alt">Altitude source</label>
+        <span class="help">GPS altitude (default) or barometric (QNE, not true altitude).</span>
+        <select id="cfg-alt">
+          <option value="gps">GPS</option>
+          <option value="baro">Barometric</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="cfg-arrow">Arrow orientation</label>
+        <span class="help">Rotate to your track/heading (default), or keep it north-up.</span>
+        <select id="cfg-arrow">
+          <option value="heading">Heading</option>
+          <option value="north">North-up</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Ranking &amp; display</h2>
+    <div class="field">
+      <label for="cfg-rankMode">Ranking mode</label>
+      <span class="help"
+        >Earliest arrival home, or latest departure that still lands you home by a target
+        time.</span
+      >
+      <select id="cfg-rankMode">
+        <option value="earliest">Earliest</option>
+        <option value="homeBy">Home by...</option>
+      </select>
+    </div>
+    <div class="field" id="homeby-field" hidden>
+      <label for="cfg-homeBy">Home by (HH:MM)</label>
+      <span class="help">Target arrival time at home; used only in home-by mode.</span>
+      <div class="homeby-row">
+        <button type="button" class="step" id="homeby-minus" aria-label="15 minutes earlier">
+          −15
+        </button>
+        <input id="cfg-homeBy" type="time" />
+        <button type="button" class="step" id="homeby-plus" aria-label="15 minutes later">
+          +15
+        </button>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="field">
+        <label for="cfg-mode">Theme</label>
+        <span class="help">Widget color theme; dark reads better in direct sunlight.</span>
+        <select id="cfg-mode">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="cfg-refresh">Refresh interval (s)</label>
+        <span class="help">Seconds between live transit API refresh cycles.</span>
+        <input id="cfg-refresh" type="number" min="10" step="10" />
+      </div>
+      <div class="field">
+        <label for="cfg-maxRoute">Routed candidates</label>
+        <span class="help">How many candidate stops get a live route lookup each cycle.</span>
+        <input id="cfg-maxRoute" type="number" min="3" step="1" />
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Widget URL</h2>
+    <code id="url-preview" class="url-preview">select a home station above</code>
+    <div class="preview-actions">
+      <button type="button" class="primary" id="copy-url" disabled>Copy URL</button>
+      <a id="test-link" class="test-link" href="#" aria-disabled="true">Test in browser →</a>
+    </div>
+    <div id="copy-status" class="copy-status" aria-live="polite"></div>
+    <div id="url-warning" class="warning" hidden></div>
+    <div class="qr-wrap" id="qr-wrap"></div>
+  </section>
+
+  <section>
+    <h2>Add to XCTrack</h2>
+    <ol class="instructions">
+      <li>In XCTrack (PRO), add a new <strong>Web page</strong> widget.</li>
+      <li>Paste the widget URL above into the widget's URL field.</li>
+      <li>Enable <strong>"Allow web page to access XCTrack data"</strong> for the widget.</li>
+      <li>Set the widget's reload interval to <strong>0</strong> (the widget refreshes itself).</li>
+      <li>
+        In flight, <strong>long-press</strong> the widget to interact with it — that's how you
+        open its own gear/settings overlay.
+      </li>
+    </ol>
+  </section>
+
+  <footer class="note">Settings are also editable later from the widget's own gear icon.</footer>
+</div>
 <script type="module" src="/src/setup.ts"></script>
