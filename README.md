@@ -85,10 +85,78 @@ choices. The picks plus a few near-front candidates are then routed live against
 transport.opendata.ch; if live departures change the ordering, the pick-3 is rerun on the
 routed data.
 
+**Home-by mode.** Instead of "earliest", the pilot sets a land-by-home deadline. Each
+candidate gets a time budget: minutes left before its latest connection that still makes
+the deadline. Stops with a negative budget (already too late) drop out; BEST becomes the
+stop with the most flying time left rather than the earliest arrival. The budget line
+turns red under 15 minutes. If no stop can make the deadline, ranking falls back to
+earliest mode silently and the widget shows that fallback happened.
+
+**Arrow orientation.** Each pick's direction arrow is drawn either heading-up (rotated
+against the aircraft's current track, from GPS speed/bearing or the compass heading when
+too slow to trust GPS course) or north-up. This is a gear setting, not a URL parameter.
+
+**Offline behaviour.** When the browser reports `navigator.onLine === false`, or the live
+transport API has gone stale with no journeys fetched yet, the widget switches to
+offline: it still ranks stops using the cached Phase 2 travel-time table (or the
+heuristic if no table is loaded) but drops departure and arrival times from each cell
+and shows an `OFFLINE` marker instead.
+
+**Limitations.**
+
+- No wind model.
+- No terrain check — reachability is a straight-line glide from the current fix to the
+  stop's elevation, ignoring ridges and valleys in between.
+- transport.opendata.ch is rate-limited to roughly 3 requests/second; a `429` response
+  is handled with a 30-second backoff before the widget asks the API again.
+- Altitude in baro mode uses XCTrack's `stdBaroAlt`, which is the standard (QNE)
+  pressure altitude referenced to 1013.25 hPa, not a true or QNH-corrected altitude.
+
 ## Setup in XCTrack
 
-TODO.
+1. Open `setup.html` (the GitHub Pages URL, e.g. `https://<user>.github.io/<repo>/setup.html`)
+   in a normal browser.
+2. Search for the home station by name and pick it from the results; the search calls
+   `transport.opendata.ch/v1/locations` directly.
+3. Adjust parameters as needed: trim speed, packing/walking minutes, safety margin,
+   max/safe glide ratio, altitude source (GPS or baro), theme, refresh interval, routed
+   stop count, arrow orientation, and ranking mode (earliest, or home-by with a
+   quarter-hour-stepped target time). Every field updates the URL preview live.
+4. Copy the generated URL, or scan the QR code with the phone running XCTrack. "Test in
+   browser" opens the widget with a bundled IGC flight replayed as the location source,
+   for a sanity check before flying.
+5. In XCTrack, add a **Web page widget** (PRO) to a flight page and paste the URL.
+6. In flight, the widget is read-only until you long-press it — XCTrack's web widget
+   only becomes interactive after a long press — after which the gear icon opens the
+   in-widget settings overlay to change mode, home-by time, arrow orientation, and
+   altitude source without leaving the flight page.
 
 ## Data
 
-TODO.
+`data/` holds the two-phase Python ETL described in `data/README.md`:
+
+- **Phase 1** (`build_stops.py`) builds `web/public/data/stops.json.gz` + `meta.json`:
+  every Swiss public-transport stop plus foreign stops within 20 km of the border, with
+  coordinates, elevation, and a mode bitmask. `verify_ids.py` confirmed the key finding
+  that makes live routing possible: the DiDok/UIC `number` in the stop dataset is
+  exactly the transport.opendata.ch station id, so the widget can route a stop with no
+  separate id-mapping step.
+- **Phase 2** (`build_homes.py` + `build_tables.py`) builds one binary table per home
+  station under `web/public/data/tables/<homeId>.bin`: the median door-to-home travel
+  time from every stop, for 3 day types × 16 departure hours, computed with r5py over
+  Swiss GTFS + OSM. `build_homes.py` produces `homes.txt`, the list of home stations to
+  build tables for. The binaries are never committed — `.github/workflows/tables.yml`
+  runs the build on a schedule and uploads them as the `tables` artifact, and
+  `deploy.yml` downloads that artifact into `web/public/data/tables/` before building
+  the site. With a table loaded the widget ranks stops from real travel times instead of
+  the straight-line heuristic; see `data/README.md` for the binary format, sizing, and
+  the tiered-build strategy the table's runtime requires.
+
+## Screenshots
+
+![Wide widget, dark theme](docs/screenshots/wide-dark.png)
+![Half-size widget, light theme](docs/screenshots/half-light.png)
+
+More sizes and both themes are in `docs/screenshots/`. `docs/mockups/` holds the earlier
+static design study (including an interactive `mockup.html`) that the in-widget visual
+identity was validated against before implementation.
