@@ -1,0 +1,19 @@
+IMPLEMENTATION_PLAN.md
+
+# Node
+node_modules/
+dist/
+
+# Python
+.venv/
+__pycache__/
+
+# ETL working files (never committed)
+data/cache/
+data/downloads/
+
+# Phase 2 travel-time tables are built by CI and deployed as an artifact
+web/public/data/tables/
+
+# OS
+.DS_Store
