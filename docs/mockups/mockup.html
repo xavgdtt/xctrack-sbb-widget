@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XCTrack Get Home widget — mockup</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #444; }
+  body.single { background: #000; }
+  .stage { display: block; }
+  .stage svg { display: block; }
+  /* gallery */
+  .gallery { padding: 16px; font: 13px/1.4 system-ui, sans-serif; color: #eee; }
+  .gallery h2 { font-size: 13px; font-weight: 600; margin: 18px 0 6px; }
+  .gallery .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+  .gallery .item { border: 1px solid #777; }
+  /* phone composite */
+  .phone { width: 412px; height: 915px; background: #d6d6d6; position: relative; }
+  .phone .widget { width: 412px; height: 200px; }
+  .phone .filler { height: 715px; background: repeating-linear-gradient(135deg,#c9c9c9 0 18px,#d2d2d2 18px 36px); }
+</style>
+</head>
+<body>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * render.ts prototype — pure function, no framework, no DOM measuring.
+ * renderWidget(svgEl, model, opts)
+ *
+ * model = {
+ *   cells: [ { role, name, distKm, L, dep, home, bearing } x3 ],
+ *   footer: { age, stale, staleText, altSource, note }
+ * }
+ * opts  = { w, h, mode:'dark'|'light', lsafe:6, lamber:9 }
+ * ------------------------------------------------------------------ */
+
+/* ---------- palette ---------- */
+
+const PALETTE = {
+  dark: {
+    bg: "#000000",
+    fg: "#ffffff",
+    muted: "#9fb0bd",
+    rule: "#3a4650",
+    green: "#31d94b",
+    amber: "#ffb01f",
+    red: "#ff4033",
+    stale: "#ffb01f",
+  },
+  light: {
+    bg: "#ffffff",
+    fg: "#000000",
+    muted: "#4a5760",
+    rule: "#b9c4cc",
+    green: "#0a7f22",
+    amber: "#9a5a00",
+    red: "#c30f04",
+    stale: "#9a5a00",
+  },
+};
+
+/* ---------- text metrics (font-independent estimate, no DOM) ---------- */
+
+const CHAR_EM = { " ": 0.28, ".": 0.30, ",": 0.30, "·": 0.34, ":": 0.30, "→": 0.95, "…": 0.85, "-": 0.36, "/": 0.36 };
+
+function charEm(ch) {
+  if (CHAR_EM[ch] !== undefined) return CHAR_EM[ch];
+  if (ch >= "0" && ch <= "9") return 0.57;
+  if (ch >= "A" && ch <= "Z") return 0.67;
+  if (ch >= "a" && ch <= "z") return "iljt".indexOf(ch) >= 0 ? 0.30 : 0.55;
+  return 0.56;
+}
+
+/** Width of `text` in em units for a bold sans-serif face. */
+function textEm(text) {
+  let em = 0;
+  for (const ch of text) em += charEm(ch);
+  return em;
+}
+
+function textWidth(text, fontSize) {
+  return textEm(text) * fontSize;
+}
+
+/** Truncate with an ellipsis so the result fits `maxWidth` at `fontSize`. */
+function truncate(text, fontSize, maxWidth) {
+  if (textWidth(text, fontSize) <= maxWidth) return text;
+  const ell = textWidth("…", fontSize);
+  let out = "";
+  let w = 0;
+  for (const ch of text) {
+    const cw = charEm(ch) * fontSize;
+    if (w + cw + ell > maxWidth) break;
+    out += ch;
+    w += cw;
+  }
+  return (out.trimEnd() || "") + "…";
+}
+
+/* ---------- small helpers ---------- */
+
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const r1 = (v) => Math.round(v * 10) / 10;
+const fmtKm = (km) => km.toFixed(1) + " km";
+const fmtL = (L) => "L " + L.toFixed(1);
+
+function glideColor(L, pal, lsafe, lamber) {
+  if (L <= lsafe) return pal.green;
+  if (L <= lamber) return pal.amber;
+  return pal.red;
+}
+
+/* ---------- svg primitives (string building) ---------- */
+
+function svgText(x, y, str, size, fill, opts) {
+  const o = opts || {};
+  const anchor = o.anchor || "start";
+  const weight = o.weight || 700;
+  const ls = o.tracking ? ` letter-spacing="${r1(o.tracking)}"` : "";
+  return `<text x="${r1(x)}" y="${r1(y)}" font-size="${r1(size)}" font-weight="${weight}" `
+       + `text-anchor="${anchor}" fill="${fill}"${ls}>${str}</text>`;
+}
+
+/** Glyph size as a fraction of the reserved box, so ring + north tick stay inside. */
+const ARROW_GLYPH = 0.72;
+const RING = 1.26;
+
+/** North-up arrow: a thick chevron rotated to `bearing`, inside a compass ring. */
+function svgArrow(cx, cy, size, bearing, color, pal) {
+  const r = size / 2;
+  const a = (bearing * Math.PI) / 180;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const pts = [[0, -1], [0.66, 0.62], [0, 0.24], [-0.66, 0.62]]
+    .map(([x, y]) => `${r1(cx + (x * ca - y * sa) * r)},${r1(cy + (x * sa + y * ca) * r)}`)
+    .join(" ");
+  let out = "";
+  if (size >= 30) {
+    const rr = r * RING;
+    const tick = Math.max(1.6, size * 0.075);
+    out += `<circle cx="${r1(cx)}" cy="${r1(cy)}" r="${r1(rr)}" fill="none" `
+         + `stroke="${pal.rule}" stroke-width="${r1(Math.max(1.4, size * 0.055))}"/>`;
+    // north tick at the top of the ring
+    out += `<line x1="${r1(cx)}" y1="${r1(cy - rr - tick * 0.2)}" x2="${r1(cx)}" y2="${r1(cy - rr + tick * 1.6)}" `
+         + `stroke="${pal.muted}" stroke-width="${r1(tick)}" stroke-linecap="round"/>`;
+  }
+  out += `<polygon points="${pts}" fill="${color}" stroke="${color}" `
+       + `stroke-width="${r1(Math.max(1.5, size * 0.09))}" stroke-linejoin="round"/>`;
+  return out;
+}
+
+/* ---------- layout ---------- */
+
+const LINE = { name: 1.00, stat: 0.92, time: 0.76 };      // font size, relative to fName
+const LEAD = { name: 1.18, stat: 1.22, time: 1.30 };      // line advance, relative to own font size
+
+/**
+ * Decide one detail level and one name font size for all three cells, so the
+ * cells stay visually uniform. Returns { detail, fName }.
+ *  detail 3 = name + dist/L + timetable
+ *  detail 2 = name + dist/L
+ *  detail 1 = dist/L only
+ */
+function fitCell(cells, availW, availH) {
+  const nameEm = Math.max(...cells.map((c) => textEm(c.name)));
+  const statEm = Math.max(...cells.map((c) => textEm(fmtKm(c.distKm) + " · " + fmtL(c.L))));
+  const timeEm = Math.max(...cells.map((c) => textEm("dep " + c.dep + " → home " + c.home)));
+
+  const tryLevel = (level) => {
+    let wEm, hUnits, cap;
+    if (level === 3) {
+      wEm = Math.max(nameEm * LINE.name, statEm * LINE.stat, timeEm * LINE.time);
+      hUnits = LINE.name * LEAD.name + LINE.stat * LEAD.stat + LINE.time * LEAD.time;
+      cap = 0.26;
+    } else if (level === 2) {
+      wEm = Math.max(nameEm * LINE.name, statEm * LINE.stat);
+      hUnits = LINE.name * LEAD.name + LINE.stat * LEAD.stat;
+      cap = 0.34;
+    } else {
+      wEm = statEm * LINE.name;
+      hUnits = LINE.name * LEAD.name;
+      cap = 0.52;
+    }
+    return Math.min(availW / wEm, availH / hUnits, availH * cap / LINE.name, 64);
+  };
+
+  let f = tryLevel(3);
+  if (f * LINE.time >= 11) return { detail: 3, fName: f };
+  f = tryLevel(2);
+  if (f >= 10.5) return { detail: 2, fName: f };
+  return { detail: 1, fName: Math.max(9, tryLevel(1)) };
+}
+
+/* ---------- cell drawing ---------- */
+
+function drawTextStack(x, yTop, width, cell, fName, detail, anchor, pal, lsafe, lamber) {
+  const col = glideColor(cell.L, pal, lsafe, lamber);
+  const tx = anchor === "middle" ? x + width / 2 : x;
+  let out = "";
+  let y = yTop;
+
+  if (detail >= 2) {
+    const f = fName * LINE.name;
+    y += f * 0.80;
+    out += svgText(tx, y, esc(truncate(cell.name, f, width)), f, pal.fg, { anchor });
+    y += f * (LEAD.name - 0.80);
+  }
+
+  // distance · L  (L carries the colour code)
+  {
+    const f = fName * (detail >= 2 ? LINE.stat : LINE.name);
+    y += f * 0.80;
+    const parts = detail >= 2
+      ? `${esc(fmtKm(cell.distKm))}<tspan fill="${pal.muted}"> · </tspan><tspan fill="${col}">${esc(fmtL(cell.L))}</tspan>`
+      : `<tspan fill="${col}">${esc(fmtL(cell.L))}</tspan><tspan fill="${pal.muted}"> · </tspan>${esc(fmtKm(cell.distKm))}`;
+    out += svgText(tx, y, parts, f, pal.fg, { anchor });
+    y += f * (LEAD.stat - 0.80);
+  }
+
+  if (detail >= 3) {
+    const f = fName * LINE.time;
+    y += f * 0.80;
+    const full = "dep " + cell.dep + " → home " + cell.home;
+    const line = textWidth(full, f) <= width
+      ? `<tspan fill="${pal.muted}">dep </tspan>${esc(cell.dep)}`
+        + `<tspan fill="${pal.muted}"> → home </tspan>${esc(cell.home)}`
+      : `${esc(cell.dep)}<tspan fill="${pal.muted}"> → </tspan>${esc(cell.home)}`;
+    out += svgText(tx, y, line, f, pal.fg, { anchor });
+  }
+  return out;
+}
+
+function drawCellColumn(x, y, cw, ch, cell, fit, pad, roleF, pal, lsafe, lamber) {
+  const col = glideColor(cell.L, pal, lsafe, lamber);
+  const arrow = Math.min(cw * 0.46, ch * 0.34);
+  const roleH = roleF * 1.5;
+  const stackH = stackHeight(fit);
+  const blockH = arrow + roleH + stackH;
+  let cy = y + Math.max(pad * 0.6, (ch - blockH) / 2);
+
+  let out = svgArrow(x + cw / 2, cy + arrow / 2, arrow * ARROW_GLYPH, cell.bearing, col, pal);
+  cy += arrow;
+  const rf = fitRole(cell.role, roleF, cw - 2 * pad);
+  out += svgText(x + cw / 2, cy + rf, esc(cell.role), rf, pal.muted,
+                 { anchor: "middle", weight: 800, tracking: rf * 0.11 });
+  cy += roleH;
+  out += drawTextStack(x + pad, cy, cw - 2 * pad, cell, fit.fName, fit.detail, "middle", pal, lsafe, lamber);
+  return out;
+}
+
+function drawCellRow(x, y, cw, ch, cell, fit, pad, roleF, pal, lsafe, lamber) {
+  const col = glideColor(cell.L, pal, lsafe, lamber);
+  const aw = Math.min(cw * 0.26, ch * 1.0, 120);
+  const roleH = roleF * 1.45;
+  const arrow = Math.min(aw * 0.78, (ch - roleH) * 0.92);
+  const acx = x + pad + aw / 2;
+  const acy = y + (ch - roleH - arrow) / 2 + arrow / 2;
+
+  let out = svgArrow(acx, acy, arrow * ARROW_GLYPH, cell.bearing, col, pal);
+  const rf = fitRole(cell.role, roleF, aw + pad * 0.6);
+  out += svgText(acx, acy + arrow * ARROW_GLYPH * RING / 2 + rf * 1.05, esc(cell.role), rf, pal.muted,
+                 { anchor: "middle", weight: 800, tracking: rf * 0.11 });
+
+  const tx = x + pad + aw + pad * 1.2;
+  const tw = x + cw - pad - tx;
+  const stackH = stackHeight(fit);
+  out += drawTextStack(tx, y + (ch - stackH) / 2, tw, cell, fit.fName, fit.detail, "start", pal, lsafe, lamber);
+  return out;
+}
+
+/** Shrink the role label until it fits `maxWidth` (tracking included). */
+function fitRole(role, size, maxWidth) {
+  const em = textEm(role) + (role.length - 1) * 0.11;
+  return Math.min(size, maxWidth / em);
+}
+
+function stackHeight(fit) {
+  const f = fit.fName;
+  if (fit.detail >= 3) return f * (LINE.name * LEAD.name + LINE.stat * LEAD.stat + LINE.time * LEAD.time);
+  if (fit.detail === 2) return f * (LINE.name * LEAD.name + LINE.stat * LEAD.stat);
+  return f * LINE.name * LEAD.name;
+}
+
+/* ---------- footer ---------- */
+
+function footerParts(footer, pal) {
+  const parts = [];
+  if (footer.stale) parts.push({ t: footer.staleText || "STALE", c: pal.stale });
+  else parts.push({ t: "age " + footer.age, c: pal.muted });
+  parts.push({ t: footer.altSource, c: pal.muted });
+  parts.push({ t: footer.note, c: pal.muted });
+  return parts;
+}
+
+function drawFooter(x, y, w, hFoot, footer, f, pal) {
+  const parts = footerParts(footer, pal);
+  const sepEm = textEm(" · ");
+  let total = 0;
+  parts.forEach((p, i) => { total += textEm(p.t) + (i ? sepEm : 0); });
+  let size = f;
+  const padX = w * 0.02;
+  if (total * size > w - 2 * padX) size = (w - 2 * padX) / total;
+  const baseline = y + hFoot / 2 + size * 0.36;
+  let out = `<line x1="${r1(x)}" y1="${r1(y)}" x2="${r1(x + w)}" y2="${r1(y)}" stroke="${pal.rule}" stroke-width="${r1(Math.max(1, size * 0.09))}"/>`;
+  let str = "";
+  parts.forEach((p, i) => {
+    if (i) str += `<tspan fill="${pal.rule}"> · </tspan>`;
+    str += `<tspan fill="${p.c}">${esc(p.t)}</tspan>`;
+  });
+  out += svgText(x + w / 2, baseline, str, size, pal.muted, { anchor: "middle", weight: 700 });
+  return out;
+}
+
+/* ---------- entry point ---------- */
+
+function renderWidget(svgEl, model, opts) {
+  const o = Object.assign({ mode: "dark", lsafe: 6, lamber: 9 }, opts || {});
+  const w = o.w || svgEl.clientWidth || 320;
+  const h = o.h || svgEl.clientHeight || 200;
+  const pal = PALETTE[o.mode === "light" ? "light" : "dark"];
+  const S = Math.min(w, h);
+  const pad = Math.max(3, S * 0.032);
+  const columns = w / h > 1.5;
+
+  // footer: only if there is room left for legible cells
+  const footF = clamp(S * 0.075, 8, 18);
+  let footH = footF * 1.95;
+  const bodyH = h - footH;
+  const showFooter = model.footer && footF >= 8.5 &&
+                     (columns ? bodyH >= S * 0.5 : bodyH / 3 >= 30) && footH / h <= 0.22;
+  if (!showFooter) footH = 0;
+
+  const cells = model.cells.slice(0, 3);
+  const roleF = clamp(S * 0.062, 7, 17);
+
+  let body = `<rect x="0" y="0" width="${w}" height="${h}" fill="${pal.bg}"/>`;
+  const usableH = h - footH;
+
+  if (columns) {
+    const cw = w / 3;
+    const arrow = Math.min(cw * 0.46, usableH * 0.34);
+    const availH = usableH - arrow - roleF * 1.5 - pad * 1.2;
+    const fit = fitCell(cells, cw - 3.2 * pad, Math.max(12, availH));
+    cells.forEach((c, i) => {
+      body += drawCellColumn(i * cw, 0, cw, usableH, c, fit, pad, roleF, pal, o.lsafe, o.lamber);
+      if (i) body += `<line x1="${r1(i * cw)}" y1="${r1(pad)}" x2="${r1(i * cw)}" y2="${r1(usableH - pad)}" stroke="${pal.rule}" stroke-width="${r1(Math.max(1, S * 0.007))}"/>`;
+    });
+  } else {
+    const ch = usableH / 3;
+    const aw = Math.min(w * 0.26, ch * 1.0, 120);
+    const tw = w - 2.2 * pad - aw - pad * 1.2;
+    const fit = fitCell(cells, Math.max(20, tw), Math.max(12, ch - pad * 1.0));
+    cells.forEach((c, i) => {
+      body += drawCellRow(0, i * ch, w, ch, c, fit, pad, roleF, pal, o.lsafe, o.lamber);
+      if (i) body += `<line x1="${r1(pad)}" y1="${r1(i * ch)}" x2="${r1(w - pad)}" y2="${r1(i * ch)}" stroke="${pal.rule}" stroke-width="${r1(Math.max(1, S * 0.005))}"/>`;
+    });
+  }
+
+  if (showFooter) body += drawFooter(0, usableH, w, footH, model.footer, footF, pal);
+
+  svgEl.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svgEl.setAttribute("width", String(w));
+  svgEl.setAttribute("height", String(h));
+  svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  svgEl.setAttribute("font-family", "'Roboto Condensed','Roboto','Helvetica Neue',Arial,sans-serif");
+  svgEl.innerHTML = body;
+  return svgEl;
+}
+
+/* ================================================================== *
+ * Example model — pilot near Interlaken at ~2400 m, home = Zürich HB
+ * ================================================================== */
+
+const MODEL = {
+  cells: [
+    { role: "SAFEST",  name: "Wilderswil",     distKm: 4.1, L: 3.2, dep: "15:48", home: "17:56", bearing: 210 },
+    { role: "BEST",    name: "Interlaken Ost", distKm: 6.8, L: 5.1, dep: "15:52", home: "17:28", bearing: 75 },
+    { role: "NEAREST", name: "Bönigen, Dorf",  distKm: 2.9, L: 2.4, dep: "15:45", home: "18:02", bearing: 330 },
+  ],
+  footer: { age: "0:42", stale: false, staleText: null, altSource: "GPS", note: "no terrain check" },
+};
+
+const MODEL_STALE = {
+  cells: [
+    { role: "SAFEST",  name: "Wilderswil",     distKm: 4.1, L: 5.9, dep: "15:48", home: "17:56", bearing: 210 },
+    { role: "BEST",    name: "Interlaken Ost", distKm: 6.8, L: 8.3, dep: "15:52", home: "17:28", bearing: 75 },
+    { role: "NEAREST", name: "Bönigen, Dorf",  distKm: 2.9, L: 11.7, dep: "15:45", home: "18:02", bearing: 330 },
+  ],
+  footer: { age: "6:04", stale: true, staleText: "STALE 6 min · offline", altSource: "BARO", note: "no terrain check" },
+};
+
+/* ---------- page harness ---------- */
+
+function makeStage(parent, w, h, model, mode) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("stage");
+  parent.appendChild(svg);
+  renderWidget(svg, model, { w, h, mode, lsafe: 6, lamber: 9 });
+  return svg;
+}
+
+(function main() {
+  const q = new URLSearchParams(location.search);
+  const mode = q.get("mode") === "light" ? "light" : "dark";
+  const model = q.get("stale") ? MODEL_STALE : MODEL;
+
+  if (q.get("phone")) {
+    document.body.classList.add("single");
+    const phone = document.createElement("div");
+    phone.className = "phone";
+    document.body.appendChild(phone);
+    const strip = document.createElement("div");
+    strip.className = "widget";
+    phone.appendChild(strip);
+    makeStage(strip, 412, 200, model, mode);
+    const filler = document.createElement("div");
+    filler.className = "filler";
+    phone.appendChild(filler);
+    return;
+  }
+
+  if (q.get("w")) {
+    document.body.classList.add("single");
+    document.body.style.background = mode === "light" ? "#fff" : "#000";
+    makeStage(document.body, +q.get("w"), +q.get("h"), model, mode);
+    return;
+  }
+
+  // gallery
+  const sizes = [[720, 220, "wide"], [360, 360, "half"], [360, 160, "small"], [180, 160, "tiny"]];
+  const g = document.createElement("div");
+  g.className = "gallery";
+  document.body.appendChild(g);
+  for (const [w, h, name] of sizes) {
+    const head = document.createElement("h2");
+    head.textContent = `${name} — ${w}×${h}`;
+    g.appendChild(head);
+    const row = document.createElement("div");
+    row.className = "row";
+    g.appendChild(row);
+    for (const m of ["dark", "light"]) {
+      const item = document.createElement("div");
+      item.className = "item";
+      row.appendChild(item);
+      makeStage(item, w, h, MODEL, m);
+    }
+    if (name === "wide") {
+      const item = document.createElement("div");
+      item.className = "item";
+      row.appendChild(item);
+      makeStage(item, w, h, MODEL_STALE, "dark");
+    }
+  }
+})();
+</script>
+</body>
+</html>
