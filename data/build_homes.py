@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pick the ~300 busiest Swiss rail stations and write them to data/homes.txt.
+"""Pick the ~100 busiest Swiss rail stations and write them to data/homes.txt.
 
 ``homes.txt`` is the destination list for ``build_tables.py``: one DiDok id per
 line, followed by ``# <official name>``. It is meant to be hand-edited — the
@@ -18,8 +18,13 @@ Two ranking modes:
   railway puts nine "rail stops within 1 km" around every halt) and under-rates
   tourist termini with few neighbours. Roughly three quarters of the stations a
   Swiss traveller would name make the top 300 under it, against a hand-checked
-  list of 50. Use ``--gtfs`` when the zip is at hand; the fallback exists so the
+  list of 50; at the default cut of 100 the misses bite harder, which is what
+  ``ALWAYS_INCLUDE`` and hand-editing are for. Use ``--gtfs`` when the zip is at hand; the fallback exists so the
   file can be regenerated from ``stops.json.gz`` alone.
+
+The list only decides which homes get an offline travel-time table. Any station
+at all works as a home in the widget, which falls back to its heuristic plus the
+live timetable API for a home that is not in this file.
 
 Both modes then take the top N after a greedy minimum-separation filter, so a
 station does not consume several of the N slots with its co-located siblings
@@ -29,7 +34,7 @@ seeded before the ranked fill, so those hubs both survive and win their cluster.
 Usage:
     uv run build_homes.py                       # fallback score
     uv run build_homes.py --gtfs downloads/gtfs_fp2026.zip
-    uv run build_homes.py --count 300 --out homes.txt
+    uv run build_homes.py --count 300 --out homes.txt   # a longer list
 """
 
 from __future__ import annotations
@@ -231,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--stops", type=Path, default=STOPS_PATH, help="stops.json.gz path")
     parser.add_argument("--out", type=Path, default=HOMES_PATH, help="output homes.txt")
-    parser.add_argument("--count", type=int, default=300, help="number of homes to keep")
+    parser.add_argument("--count", type=int, default=100,
+                        help="number of homes to keep (one travel-time table each)")
     parser.add_argument(
         "--gtfs", type=Path, help="GTFS zip; rank by departures on --gtfs-day instead of the fallback"
     )

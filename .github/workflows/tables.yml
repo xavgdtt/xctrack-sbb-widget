@@ -1,6 +1,6 @@
 name: Travel-time tables
 
-# Monthly rebuild of web/public/data/tables/<homeId>.bin (Phase 2).
+# Monthly rebuild of web/public/data/tables/<homeId>.bin.gz (Phase 2).
 #
 # The tables are never committed: this workflow publishes them as an artifact
 # named "tables", and deploy.yml downloads the newest successful one before it
@@ -100,7 +100,7 @@ jobs:
             echo "### Travel-time tables"
             echo
             echo "- tables: $(ls web/public/data/tables | wc -l)"
-            echo "- total size: $(du -sh web/public/data/tables | cut -f1)"
+            echo "- total size: $(du -sh web/public/data/tables | cut -f1) (gzipped)"
             echo "- day types: \`$DAY_TYPES\`, hours: \`$HOURS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { HEADER_BYTES, UNREACHABLE, decodeTable } from "../src/table";
+import { gzipSync } from "node:zlib";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HEADER_BYTES, UNREACHABLE, decodeTable, loadTable } from "../src/table";
 
 const BUILD_ID = "2026-09-11-4b9110db"; // 19 chars: the header keeps the first 16
 
@@ -47,6 +48,10 @@ function makeTable(spec: TableSpec = {}): ArrayBuffer {
   }
   return buffer;
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 const at = (y: number, m: number, d: number, h: number): number =>
   new Date(y, m - 1, d, h, 0).getTime();
@@ -100,5 +105,48 @@ describe("decodeTable", () => {
     ).toBeNull();
     expect(decodeTable(makeTable().slice(0, 40), { buildId: BUILD_ID })).toBeNull();
     expect(decodeTable(new ArrayBuffer(8), { buildId: BUILD_ID })).toBeNull();
+  });
+});
+
+describe("loadTable", () => {
+  const META = JSON.stringify({ buildId: BUILD_ID });
+
+  it("decompresses tables/<homeId>.bin.gz", async () => {
+    const gz = gzipSync(Buffer.from(makeTable()));
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", (url: string) => {
+      seen.push(url);
+      return Promise.resolve(new Response(url.endsWith("meta.json") ? META : gz));
+    });
+    const table = await loadTable(8507000, "/");
+    expect(seen).toEqual(["/data/meta.json", "/data/tables/8507000.bin.gz"]);
+    expect(table!.homeId).toBe(8507000);
+  });
+
+  it("falls back to the uncompressed table when the gzip fetch fails", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", (url: string) => {
+      seen.push(url);
+      if (url.endsWith("meta.json")) return Promise.resolve(new Response(META));
+      return url.endsWith(".gz")
+        ? Promise.resolve(new Response("", { status: 404 }))
+        : Promise.resolve(new Response(makeTable()));
+    });
+    const table = await loadTable(8507000, "/base");
+    expect(seen).toEqual([
+      "/base/data/meta.json",
+      "/base/data/tables/8507000.bin.gz",
+      "/base/data/tables/8507000.bin",
+    ]);
+    expect(table!.stopCount).toBe(3);
+  });
+
+  it("returns null when neither file is there", async () => {
+    vi.stubGlobal("fetch", (url: string) =>
+      Promise.resolve(
+        url.endsWith("meta.json") ? new Response(META) : new Response("", { status: 404 }),
+      ),
+    );
+    expect(await loadTable(8507000, "/")).toBeNull();
   });
 });

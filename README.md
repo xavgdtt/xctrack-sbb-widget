@@ -142,15 +142,16 @@ and shows an `OFFLINE` marker instead.
   exactly the transport.opendata.ch station id, so the widget can route a stop with no
   separate id-mapping step.
 - **Phase 2** (`build_homes.py` + `build_tables.py`) builds one binary table per home
-  station under `web/public/data/tables/<homeId>.bin`: the median door-to-home travel
-  time from every stop, for 3 day types × 16 departure hours, computed with r5py over
-  Swiss GTFS + OSM. `build_homes.py` produces `homes.txt`, the list of home stations to
-  build tables for. The binaries are never committed — `.github/workflows/tables.yml`
+  station under `web/public/data/tables/<homeId>.bin.gz`: the median travel time
+  between the home and every stop, for 3 day types × 16 departure hours, computed with
+  r5py over Swiss GTFS + OSM. `build_homes.py` produces `homes.txt`, the ~100 home
+  stations to build tables for; any other station still works as a home in the widget,
+  just without an offline table. The binaries are never committed — `.github/workflows/tables.yml`
   runs the build on a schedule and uploads them as the `tables` artifact, and
   `deploy.yml` downloads that artifact into `web/public/data/tables/` before building
   the site. With a table loaded the widget ranks stops from real travel times instead of
   the straight-line heuristic; see `data/README.md` for the binary format, sizing, and
-  the tiered-build strategy the table's runtime requires.
+  why the tables are routed home → stop and used in the other direction.
 
 ## Screenshots
 

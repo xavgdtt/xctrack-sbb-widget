@@ -12,6 +12,7 @@ Run with ``uv run pytest`` (no r5py needed — the r5py imports in
 from __future__ import annotations
 
 import datetime as dt
+import gzip
 import struct
 
 import numpy as np
@@ -115,7 +116,8 @@ def test_missing_checkpoints_are_written_as_unreachable(tmp_path):
     )
 
     assert bt.write_tables(tmp_path / "out", tmp_path, [home_id], "bid", stop_count) == 1
-    header, minutes = decode((tmp_path / "out" / f"{home_id}.bin").read_bytes())
+    blob = gzip.decompress((tmp_path / "out" / f"{home_id}.bin.gz").read_bytes())
+    header, minutes = decode(blob)
 
     assert header["homeId"] == home_id
     assert np.array_equal(minutes[day_type, hour - bt.HOUR_START], values)
@@ -133,6 +135,29 @@ def test_checkpoints_merge_hour_by_hour(tmp_path):
     assert bt.load_checkpoint(path, 2)[7].tolist() == [3, 4]
     # A checkpoint built against a different stop list must not be reused.
     assert bt.load_checkpoint(path, 3) == {}
+
+
+def test_the_plain_copy_is_written_only_with_also_plain(tmp_path):
+    """table.ts fetches the .gz; the .bin is the DecompressionStream fallback."""
+    home_id = 8503000
+    bt.save_checkpoint(
+        bt.checkpoint_path(tmp_path, home_id, 0),
+        {6: np.array([7, 8], dtype=np.uint16)},
+        dt.date(2026, 10, 5),
+    )
+    out = tmp_path / "out"
+
+    bt.write_tables(out, tmp_path, [home_id], "bid", 2)
+    assert not (out / f"{home_id}.bin").exists()
+
+    bt.write_tables(out, tmp_path, [home_id], "bid", 2, also_plain=True)
+    assert (out / f"{home_id}.bin").read_bytes() == gzip.decompress(
+        (out / f"{home_id}.bin.gz").read_bytes()
+    )
+
+    # A plain copy from an earlier run is removed, never served stale.
+    bt.write_tables(out, tmp_path, [home_id], "bid", 2)
+    assert not (out / f"{home_id}.bin").exists()
 
 
 def test_hour_spec_is_parsed_and_clamped_to_the_header_range():

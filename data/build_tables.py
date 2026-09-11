@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
-"""Build web/public/data/tables/<homeId>.bin — offline travel-time tables (Phase 2).
+"""Build web/public/data/tables/<homeId>.bin.gz — offline travel-time tables (Phase 2).
 
 For every home station in ``homes.txt`` the widget gets one table: the median
-door-to-home travel time, including the initial wait, from *every* stop in
+travel time, including the initial wait, between the home and *every* stop in
 ``stops.json.gz``, for three day types and sixteen departure hours. With the
 table cached the widget can rank stops with no network at all.
 
 Pipeline: Swiss GTFS (opentransportdata.swiss permalink) + a Switzerland OSM
 extract (Geofabrik, cropped with ``osmium`` when available) -> an R5 transport
 network via r5py -> one ``r5py.TravelTimeMatrix`` per (day type, hour, batch of
-homes), origins = all stops, destinations = the homes.
+homes), origins = the homes, destinations = all stops.
+
+The matrix is computed **home -> stop**, not stop -> home, because R5 runs one
+search per origin: 100 homes cost 100 searches, 34,362 stops would cost 34,362.
+The widget needs the stop -> home direction, and takes this as an approximation:
+transit travel time is close to symmetric, but the initial wait is measured at
+the home end rather than at the stop. The error is a few minutes on frequent
+services and up to one headway on an hourly postbus. See data/README.md.
 
 Binary format (must match web/src/table.ts) — 32-byte little-endian header:
 
     magic "XSBT" (4) | version u8 = 1 | dayTypes u8 = 3 | hourStart u8 = 6
     | hourCount u8 = 16 | stopCount u32 | homeId u32 | buildId 16 bytes ASCII
 
-followed by ``u16 minutes[dayType][hour][stopIdx]``, 65535 = unreachable.
+followed by ``u16 minutes[dayType][hour][stopIdx]``, 65535 = unreachable. The
+file is gzipped (``<homeId>.bin.gz``); ``--also-plain`` additionally writes the
+uncompressed ``<homeId>.bin`` that ``table.ts`` falls back to where the WebView
+has no ``DecompressionStream``.
 ``stopIdx`` is the position in ``stops.json.gz`` (sorted by id), which is why
 the table carries the ``buildId`` of the ``meta.json`` it was built against:
 a widget that sees a different id must ignore the table.
 
-Runtime is the hard part — see data/README.md. The run is resumable per home
-and per day type (checkpoints under ``cache/tables/<buildId>/``), takes a
-``--time-budget-min``, and is meant to be tiered with ``--homes-limit``,
-``--hours`` and ``--day-types`` until the whole set fits the CI budget.
+With the homes as origins the whole 3 x 16 grid for 100 homes is a few thousand
+searches and fits one CI run — see data/README.md. The run is still resumable
+per home and per day type (checkpoints under ``cache/tables/h2s-<buildId>-...``)
+and still takes a ``--time-budget-min``; ``--homes-limit``, ``--hours`` and
+``--day-types`` remain for narrowing a run.
 
 Usage:
     uv run --group tables build_tables.py --selftest        # no r5py, no data
@@ -129,6 +140,23 @@ def encode_table(home_id: int, build_id: str, minutes: np.ndarray) -> bytes:
     )
     body = np.ascontiguousarray(minutes, dtype="<u2")
     return header + body.tobytes()
+
+
+def write_table_files(path: Path, blob: bytes, also_plain: bool) -> None:
+    """Write ``<path>.gz``, and ``<path>`` itself only when ``also_plain``.
+
+    The gzip is deterministic (level 9, ``mtime=0``), so an unchanged table is
+    byte-identical between runs. GitHub Pages serves ``.gz`` without a
+    ``Content-Encoding`` header, so ``table.ts`` decompresses it in the browser
+    with ``DecompressionStream('gzip')`` and falls back to the plain file where
+    that API is missing. Without ``--also-plain`` a plain file left over from an
+    earlier run is deleted rather than left to be served stale.
+    """
+    path.with_suffix(path.suffix + ".gz").write_bytes(gzip.compress(blob, 9, mtime=0))
+    if also_plain:
+        path.write_bytes(blob)
+    elif path.exists():
+        path.unlink()
 
 
 def minutes_from_travel_times(values: np.ndarray) -> np.ndarray:
@@ -446,7 +474,12 @@ def parse_hours(spec: str) -> list[int]:
 
 
 def write_tables(
-    out_dir: Path, root: Path, homes: list[int], build_id: str, stop_count: int
+    out_dir: Path,
+    root: Path,
+    homes: list[int],
+    build_id: str,
+    stop_count: int,
+    also_plain: bool = False,
 ) -> int:
     """Assemble every checkpoint for each home into one .bin. Missing day types
     and hours are written as unreachable, so a partial (tiered) build still
@@ -463,7 +496,9 @@ def write_tables(
         if filled == 0:
             log.warning("home %d has no computed cell — skipping", home_id)
             continue
-        (out_dir / f"{home_id}.bin").write_bytes(encode_table(home_id, build_id, minutes))
+        write_table_files(
+            out_dir / f"{home_id}.bin", encode_table(home_id, build_id, minutes), also_plain
+        )
         written += 1
         if filled < DAY_TYPES * HOUR_COUNT:
             log.info("home %d: %d/%d cells computed", home_id, filled, DAY_TYPES * HOUR_COUNT)
@@ -484,9 +519,11 @@ def selftest(out_dir: Path, stop_count: int = 500, seed: int = 7) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{home_id}.bin"
-    path.write_bytes(encode_table(home_id, build_id, minutes))
+    write_table_files(path, encode_table(home_id, build_id, minutes), also_plain=True)
 
-    blob = path.read_bytes()
+    gz_path = path.with_suffix(".bin.gz")
+    blob = gzip.decompress(gz_path.read_bytes())
+    assert blob == path.read_bytes(), "gzip and plain copies disagree"
     magic, version, day_types, hour_start, hour_count, count, hid, bid = HEADER_STRUCT.unpack_from(blob)
     assert magic == MAGIC, magic
     assert (version, day_types, hour_start, hour_count) == (VERSION, DAY_TYPES, HOUR_START, HOUR_COUNT)
@@ -495,7 +532,10 @@ def selftest(out_dir: Path, stop_count: int = 500, seed: int = 7) -> int:
     body = np.frombuffer(blob, dtype="<u2", offset=HEADER_STRUCT.size)
     assert len(blob) == HEADER_STRUCT.size + 2 * DAY_TYPES * HOUR_COUNT * stop_count, len(blob)
     assert np.array_equal(body.reshape(minutes.shape), minutes)
-    log.info("selftest OK: %s, %d bytes, round-trip exact", path, len(blob))
+    log.info(
+        "selftest OK: %s, %d bytes (%d gzipped), round-trip exact",
+        gz_path, len(blob), gz_path.stat().st_size,
+    )
     return 0
 
 
@@ -503,7 +543,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--out-dir", type=Path, help=f"where the .bin files go (default {OUT_DIR})")
+    parser.add_argument("--out-dir", type=Path, help=f"where the .bin.gz files go (default {OUT_DIR})")
+    parser.add_argument("--also-plain", action="store_true",
+                        help="also write the uncompressed <homeId>.bin fallback")
     parser.add_argument("--homes", type=Path, default=HOMES_PATH, help="homes.txt path")
     parser.add_argument("--homes-limit", type=int, help="only the first N homes (tiering)")
     parser.add_argument("--hours", default=f"{HOUR_START}-{HOUR_START + HOUR_COUNT - 1}",
@@ -511,9 +553,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--day-types", default="0,1,2",
                         help="day types to compute: 0 = Mon-Fri, 1 = Sat, 2 = Sun/holiday")
     parser.add_argument("--home-batch", type=int, default=100,
-                        help="homes per r5py call; R5 reaches all destinations in "
-                             "one search per origin, so a bigger batch is nearly "
-                             "free in time and costs only result-frame memory")
+                        help="homes (= origins) per r5py call; R5 runs one search "
+                             "per origin, so the batch size trades result-frame "
+                             "memory (batch x 34k rows) against call overhead")
     parser.add_argument("--departure-window-min", type=int, default=60,
                         help="departure window R5 takes the median over")
     parser.add_argument("--max-time-min", type=int, default=180, help="routing cut-off")
@@ -579,7 +621,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Checkpoints are only valid for one (stop list, timetable) pair: the stop
     # list fixes the index, the timetable fixes the numbers.
-    root = CACHE_DIR / f"{build_id}-{file_digest(gtfs)}"
+    # The "h2s" prefix marks the home -> stop direction: checkpoints from the
+    # earlier stop -> home builds hold different numbers and must not be reused.
+    root = CACHE_DIR / f"h2s-{build_id}-{file_digest(gtfs)}"
     root.mkdir(parents=True, exist_ok=True)
     (root / "dates.json").write_text(
         json.dumps({DAY_TYPE_NAMES[d]: dates[d].isoformat() for d in day_types}, indent=2) + "\n",
@@ -605,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("every requested cell is already checkpointed")
     else:
         network = build_network(osm, gtfs)
-        origins = points_frame(stops)
+        destinations = points_frame(stops)
         for day_type, hour, batch in todo:
             if deadline and time.monotonic() > deadline:
                 log.warning("time budget reached — stopping with checkpoints intact")
@@ -618,17 +662,17 @@ def main(argv: list[str] | None = None) -> int:
             cell_started = time.monotonic()
             values = travel_times(
                 network,
-                origins,
                 points_frame([by_id[h] for h in pending]),
+                destinations,
                 departure,
                 args.departure_window_min,
                 args.max_time_min,
             )
             minutes = minutes_from_travel_times(values)
-            for column, home in enumerate(pending):
+            for row, home in enumerate(pending):
                 path = checkpoint_path(root, home, day_type)
                 by_hour = load_checkpoint(path, len(stops))
-                by_hour[hour] = minutes[:, column]
+                by_hour[hour] = minutes[row]
                 save_checkpoint(path, by_hour, dates[day_type])
                 done[(home, day_type)].add(hour)
             log.info(
@@ -638,7 +682,7 @@ def main(argv: list[str] | None = None) -> int:
                 100.0 * np.mean(minutes != UNREACHABLE),
             )
 
-    written = write_tables(out_dir, root, homes, build_id, len(stops))
+    written = write_tables(out_dir, root, homes, build_id, len(stops), args.also_plain)
     log.info("done in %.1f min; %d tables", (time.monotonic() - started) / 60, written)
     if budget_hit:
         log.warning("build is INCOMPLETE — re-run with the same cache to continue")

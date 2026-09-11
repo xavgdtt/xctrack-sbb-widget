@@ -1,6 +1,9 @@
-// Per-home travel-time table (phase 2): a small binary of median door-to-home
-// travel times, indexed by day type, departure hour and stop index. It lets the
-// widget rank stops with no network at all.
+// Per-home travel-time table (phase 2): a small gzipped binary of median travel
+// times between the home and every stop, indexed by day type, departure hour and
+// stop index. It lets the widget rank stops with no network at all.
+//
+// The times are computed home -> stop and used stop -> home, so the initial wait
+// is the one at the home end (see data/README.md).
 //
 // The layout must stay in step with data/build_tables.py.
 
@@ -78,7 +81,7 @@ export function decodeTable(
 }
 
 /**
- * Fetch `tables/<homeId>.bin` and validate it against `meta.json`'s build id.
+ * Fetch `tables/<homeId>.bin.gz` and validate it against `meta.json`'s build id.
  * Returns null when the table is missing, stale, or malformed.
  */
 export async function loadTable(
@@ -89,12 +92,35 @@ export async function loadTable(
   try {
     const buildId = await loadBuildId(base);
     if (!buildId) return null;
-    const res = await fetch(`${base}data/tables/${homeId}.bin`);
-    if (!res.ok) return null;
-    return decodeTable(await res.arrayBuffer(), { buildId, homeId });
+    const buffer = await fetchTable(
+      `${base}data/tables/${homeId}.bin.gz`,
+      `${base}data/tables/${homeId}.bin`,
+    );
+    return buffer && decodeTable(buffer, { buildId, homeId });
   } catch {
     return null;
   }
+}
+
+/**
+ * Fetch the gzipped table and decompress it in the browser, because GitHub Pages
+ * serves `.gz` without a `Content-Encoding` header. Falls back to the plain
+ * `.bin`, which `build_tables.py` writes only with `--also-plain`, where
+ * `DecompressionStream` is missing. Returns null when neither can be fetched.
+ */
+async function fetchTable(gzUrl: string, plainUrl: string): Promise<ArrayBuffer | null> {
+  if (typeof DecompressionStream !== "undefined") {
+    try {
+      const res = await fetch(gzUrl);
+      if (!res.ok || !res.body) throw new Error(`${gzUrl}: HTTP ${res.status}`);
+      const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
+      return await new Response(stream).arrayBuffer();
+    } catch {
+      // Fall through to the uncompressed copy.
+    }
+  }
+  const res = await fetch(plainUrl);
+  return res.ok ? await res.arrayBuffer() : null;
 }
 
 /** The dataset build id from meta.json, or null if it cannot be read. */

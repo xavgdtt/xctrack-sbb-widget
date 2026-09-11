@@ -4,7 +4,7 @@
 //
 // Strategy:
 //   same-origin app shell + data  -> cache-first, filled on install and on use
-//   data/tables/*.bin             -> cache-first, revalidated once a week
+//   data/tables/*.bin[.gz]        -> cache-first, revalidated once a week
 //   transport.opendata.ch         -> not intercepted; the app layer owns offline
 
 export {};
@@ -84,7 +84,11 @@ sw.addEventListener("fetch", (event) => {
   }
   // transport.opendata.ch and anything else cross-origin: network only.
   if (url.origin !== sw.location.origin) return;
-  if (url.pathname.includes("/data/tables/") && url.pathname.endsWith(".bin")) {
+  // Tables ship gzipped; .bin is the fallback build_tables.py --also-plain emits.
+  if (
+    url.pathname.includes("/data/tables/") &&
+    (url.pathname.endsWith(".bin") || url.pathname.endsWith(".bin.gz"))
+  ) {
     event.respondWith(tableFirst(req));
     return;
   }
