@@ -4,6 +4,7 @@ import {
   fitCell,
   gearSize,
   isColumns,
+  northTickDeg,
   render,
   type Cell,
 } from "../src/render";
@@ -72,6 +73,16 @@ function model(over: Partial<RenderModel> = {}): RenderModel {
     message: null,
     ...over,
   };
+}
+
+/** The compass ring's north ticks: the only round-capped lines render() draws. */
+function ticks(markup: string): { x1: number; y1: number; x2: number; y2: number }[] {
+  const re = /<line x1="([-\d.]+)" y1="([-\d.]+)" x2="([-\d.]+)" y2="([-\d.]+)"[^>]*stroke-linecap="round"/g;
+  const out: { x1: number; y1: number; x2: number; y2: number }[] = [];
+  for (const m of markup.matchAll(re)) {
+    out.push({ x1: Number(m[1]), y1: Number(m[2]), x2: Number(m[3]), y2: Number(m[4]) });
+  }
+  return out;
 }
 
 describe("layout rule", () => {
@@ -164,6 +175,27 @@ describe("render", () => {
     const withTrack = fakeSvg();
     render(withTrack, model({ arrow: "heading", track: 180 }), 720, 220);
     expect(withTrack.innerHTML).not.toContain(">N</text>");
+  });
+
+  it("rotates the compass north tick with the ring in heading mode", () => {
+    expect(northTickDeg(model({ arrow: "heading", track: 90 }))).toBe(270);
+    expect(northTickDeg(model({ arrow: "north", track: 90 }))).toBe(0);
+    expect(northTickDeg(model({ arrow: "heading", track: null }))).toBe(0);
+
+    // Flying east, so north is 90 degrees to the pilot's left: the tick lies on
+    // the left of the ring, pointing inwards from there.
+    const east = fakeSvg();
+    render(east, model({ arrow: "heading", track: 90 }), 720, 220);
+    const tick = ticks(east.innerHTML)[0]!;
+    expect(tick.y1).toBeCloseTo(tick.y2, 1);
+    expect(tick.x1).toBeLessThan(tick.x2);
+
+    // North-up keeps it at the top, whatever the track.
+    const up = fakeSvg();
+    render(up, model({ arrow: "north", track: 90 }), 720, 220);
+    const top = ticks(up.innerHTML)[0]!;
+    expect(top.x1).toBeCloseTo(top.x2, 1);
+    expect(top.y1).toBeLessThan(top.y2);
   });
 
   it("shows a big centred message instead of cells", () => {

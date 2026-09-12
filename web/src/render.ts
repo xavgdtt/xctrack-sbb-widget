@@ -174,9 +174,11 @@ const RING = 1.26;
 
 /**
  * Direction arrow: a thick chevron rotated to `bearing` (already in screen
- * degrees, i.e. heading-relative or true north) inside a compass ring. With
- * `northMark` the ring gets a small "N", which is how the heading arrow mode
- * admits that it has no track and has fallen back to north-up.
+ * degrees, i.e. heading-relative or true north) inside a compass ring. The tick
+ * on the ring marks true north, drawn at `tickDeg` in those same screen degrees,
+ * so in heading-up mode the ring turns with the pilot. With `northMark` the ring
+ * gets a small "N", which is how the heading arrow mode admits that it has no
+ * track and has fallen back to north-up.
  */
 function svgArrow(
   cx: number,
@@ -185,6 +187,7 @@ function svgArrow(
   bearing: number,
   color: string,
   pal: Palette,
+  tickDeg: number,
   northMark: boolean,
 ): string {
   const r = size / 2;
@@ -201,8 +204,12 @@ function svgArrow(
     out +=
       `<circle cx="${r1(cx)}" cy="${r1(cy)}" r="${r1(rr)}" fill="none" ` +
       `stroke="${pal.rule}" stroke-width="${r1(Math.max(1.4, size * 0.055))}"/>`;
+    const ta = (tickDeg * Math.PI) / 180;
+    const tOut = rr + tick * 0.2;
+    const tIn = rr - tick * 1.6;
     out +=
-      `<line x1="${r1(cx)}" y1="${r1(cy - rr - tick * 0.2)}" x2="${r1(cx)}" y2="${r1(cy - rr + tick * 1.6)}" ` +
+      `<line x1="${r1(cx + Math.sin(ta) * tOut)}" y1="${r1(cy - Math.cos(ta) * tOut)}" ` +
+      `x2="${r1(cx + Math.sin(ta) * tIn)}" y2="${r1(cy - Math.cos(ta) * tIn)}" ` +
       `stroke="${pal.muted}" stroke-width="${r1(tick)}" stroke-linecap="round"/>`;
     if (northMark) {
       const nf = Math.max(7, size * 0.26);
@@ -511,6 +518,8 @@ function drawCellColumn(
   pal: Palette,
   lsafe: number,
   lamber: number,
+  /** Screen-space angle of true north, degrees clockwise from up. */
+  tickDeg: number,
   northMark: boolean,
 ): string {
   const col = glideColor(cell.L, pal, lsafe, lamber);
@@ -519,7 +528,7 @@ function drawCellColumn(
   const blockH = arrow + roleH + stackHeight(fit);
   let cy = y + Math.max(pad * 0.6, (ch - blockH) / 2);
 
-  let out = svgArrow(x + cw / 2, cy + arrow / 2, arrow * ARROW_GLYPH, cell.bearing, col, pal, northMark);
+  let out = svgArrow(x + cw / 2, cy + arrow / 2, arrow * ARROW_GLYPH, cell.bearing, col, pal, tickDeg, northMark);
   cy += arrow;
   if (fit.role) {
     const rf = fitRole(cell.role, roleF, cw - 2 * pad);
@@ -546,6 +555,8 @@ function drawCellRow(
   pal: Palette,
   lsafe: number,
   lamber: number,
+  /** Screen-space angle of true north, degrees clockwise from up. */
+  tickDeg: number,
   northMark: boolean,
   /** Width kept clear on the right, for the gear in the top row. */
   reserveRight: number,
@@ -557,7 +568,7 @@ function drawCellRow(
   const acx = x + pad + aw / 2;
   const acy = y + (ch - roleH - arrow) / 2 + arrow / 2;
 
-  let out = svgArrow(acx, acy, arrow * ARROW_GLYPH, cell.bearing, col, pal, northMark);
+  let out = svgArrow(acx, acy, arrow * ARROW_GLYPH, cell.bearing, col, pal, tickDeg, northMark);
   if (fit.role) {
     const rf = fitRole(cell.role, roleF, aw + pad * 0.6);
     out += svgText(acx, acy + (arrow * ARROW_GLYPH * RING) / 2 + rf * 1.05, esc(cell.role), rf, pal.accent, {
@@ -676,6 +687,16 @@ function drawMessage(w: number, h: number, text: string, pad: number, pal: Palet
 
 /* ---------- entry point ---------- */
 
+/**
+ * Screen-space angle of the compass ring's north tick, degrees clockwise from
+ * up. Heading-up mode turns the ring against the pilot's track, so north sits at
+ * `-track`; north-up mode, and heading-up with no track, keep the tick at the top.
+ */
+export function northTickDeg(model: RenderModel): number {
+  if (model.arrow !== "heading" || model.track === null) return 0;
+  return ((-model.track % 360) + 360) % 360;
+}
+
 /** Three columns above this aspect ratio, three rows below it. */
 export const COLUMN_ASPECT = 1.5;
 
@@ -722,6 +743,7 @@ export function render(svg: SVGSVGElement, model: RenderModel, w: number, h: num
   const roleF = clamp(S * 0.062, 7, 17);
   const usableH = h - footH;
   const northMark = model.arrow === "heading" && model.track === null;
+  const tickDeg = northTickDeg(model);
 
   if (columns) {
     const cw = w / n;
@@ -729,7 +751,7 @@ export function render(svg: SVGSVGElement, model: RenderModel, w: number, h: num
     const availH = Math.max(12, usableH - arrow - pad * 1.2);
     const fit = fitCell(cells, cw - 3.2 * pad, availH, roleF * 1.5);
     cells.forEach((c, i) => {
-      body += drawCellColumn(i * cw, 0, cw, usableH, c, fit, pad, roleF, pal, lsafe, lamber, northMark);
+      body += drawCellColumn(i * cw, 0, cw, usableH, c, fit, pad, roleF, pal, lsafe, lamber, tickDeg, northMark);
       if (i)
         body +=
           `<line x1="${r1(i * cw)}" y1="${r1(pad)}" x2="${r1(i * cw)}" y2="${r1(usableH - pad)}" ` +
@@ -744,7 +766,7 @@ export function render(svg: SVGSVGElement, model: RenderModel, w: number, h: num
     const tw = w - 2.2 * pad - aw - pad * 1.2 - reserve;
     const fit = fitCell(cells, Math.max(20, tw), Math.max(12, ch - pad * 1.0));
     cells.forEach((c, i) => {
-      body += drawCellRow(0, i * ch, w, ch, c, fit, pad, roleF, pal, lsafe, lamber, northMark, i === 0 ? reserve : 0);
+      body += drawCellRow(0, i * ch, w, ch, c, fit, pad, roleF, pal, lsafe, lamber, tickDeg, northMark, i === 0 ? reserve : 0);
       if (i)
         body +=
           `<line x1="${r1(pad)}" y1="${r1(i * ch)}" x2="${r1(w - pad)}" y2="${r1(i * ch)}" ` +

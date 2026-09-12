@@ -99,7 +99,12 @@ nothing at all. Until the bridge returns a valid fix the widget shows
 `waiting for XCTrack GPS`. Geolocation is used only outside XCTrack, and only when no
 `replay` parameter is given. A fix is aged from the wall-clock moment it arrived, not
 from the timestamp it carries, so a replay of a recorded flight is not immediately
-"GPS lost". Adding `?debug=1` to the widget URL draws a corner showing the active source,
+"GPS lost". The timestamp it carries is the widget's clock instead: earliest departures,
+the times sent to transport.opendata.ch, the home-by budget, the travel-time table's day
+and hour bucket and the displayed data age are all computed in the time the source
+reports, so a flight fed from an external vario or replayed from an IGC file is planned
+in its own time rather than the phone's. Sources that report no time (geolocation, the
+`?lat=&lng=` fallback) leave the widget on wall-clock time. Adding `?debug=1` to the widget URL draws a corner showing the active source,
 the number of fixes received and the last raw payload.
 
 **Arrow orientation.** Each pick's direction arrow is drawn either heading-up (rotated

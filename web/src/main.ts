@@ -7,6 +7,7 @@
 // Everything that draws lives in render.ts; everything that talks to the network
 // lives in transport.ts. This file only sequences them.
 
+import { createClock } from "./clock";
 import { getConfig, initConfig, onConfigChange } from "./config";
 import { haversineM } from "./geo";
 import { createOverlay } from "./overlay";
@@ -42,6 +43,8 @@ function el<K extends keyof SVGElementTagNameMap>(tag: K): SVGElementTagNameMap[
 
 function start(): Loop {
   const cfg0 = initConfig();
+  // Everything the widget computes with runs on the flight's clock; see clock.ts.
+  const clock = createClock();
   const host = document.getElementById("app");
   if (!host) throw new Error("#app missing");
   host.textContent = "";
@@ -91,9 +94,12 @@ function start(): Loop {
   let journeys: Map<number, Journey> = new Map();
   let model: RenderModel = idleModel(cfg0, "loading stops…");
 
-  /** Fix and time of the last completed routing cycle, for the refresh triggers. */
+  /** Fix and time of the last completed routing cycle. */
   let cycleFix: Fix | null = null;
+  /** Flight-clock time of that cycle, for the displayed data age. */
   let cycleAt = 0;
+  /** Wall-clock time of that cycle, for the refresh interval. */
+  let cycleAtWall = 0;
   let cycleRunning = false;
 
   function draw(): void {
@@ -114,12 +120,13 @@ function start(): Loop {
       draw();
       return;
     }
-    const now = Date.now();
-    if (now - fix.t > FIX_TIMEOUT_MS) {
+    // Staleness is elapsed real time since the fix arrived, not flight time.
+    if (Date.now() - fix.t > FIX_TIMEOUT_MS) {
       model = idleModel(cfg, "GPS lost");
       draw();
       return;
     }
+    const now = clock.nowMs();
     candidates = buildCandidates(fix, stops, cfg, {
       home,
       travelEst: table ? (idx, dep) => table!.lookup(idx, dep) : null,
@@ -162,7 +169,7 @@ function start(): Loop {
     const cfg = getConfig();
     const at = fix;
     try {
-      const now = Date.now();
+      const now = clock.nowMs();
       const homeByMs = cfg.homeBy ? parseHHMM(cfg.homeBy, now) : null;
       const arrival = cfg.rankMode === "homeBy" && homeByMs !== null;
       const requests = routeTargets(candidates, model.picks.map((p) => p.cand), cfg.maxRoute).map(
@@ -176,7 +183,8 @@ function start(): Loop {
       }
       journeys = next;
       cycleFix = at;
-      cycleAt = Date.now();
+      cycleAt = clock.nowMs();
+      cycleAtWall = Date.now();
     } catch {
       // transport.ts already keeps the last good result and flags staleness.
     } finally {
@@ -190,7 +198,7 @@ function start(): Loop {
     if (!fix || cycleRunning) return;
     const due =
       cycleFix === null ||
-      Date.now() - cycleAt >= cfg.refresh * 1000 ||
+      Date.now() - cycleAtWall >= cfg.refresh * 1000 ||
       haversineM(fix.lat, fix.lon, cycleFix.lat, cycleFix.lon) > MOVE_TRIGGER_M ||
       Math.abs(fix.alt - cycleFix.alt) > ALT_TRIGGER_M;
     if (due) void cycle();
@@ -202,6 +210,7 @@ function start(): Loop {
     cfg0,
     (f) => {
       fix = f;
+      clock.sync(f);
       recompute();
       maybeCycle();
     },
