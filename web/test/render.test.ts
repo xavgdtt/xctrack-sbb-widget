@@ -67,7 +67,6 @@ function model(over: Partial<RenderModel> = {}): RenderModel {
     ageSec: 42,
     stale: false,
     offline: false,
-    altSource: "gps",
     theme: "dark",
     noFix: false,
     message: null,

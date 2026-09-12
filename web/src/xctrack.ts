@@ -1,6 +1,12 @@
 // Location sources, in priority order: XCTrack's JS bridge, an IGC replay, the
 // browser's geolocation, and finally the static ?lat=&lng= the XCTrack widget URL
 // can substitute. Only one source is ever active.
+//
+// Inside XCTrack the bridge is the ONLY source: many pilots feed XCTrack from an
+// external vario, and XCTrack's own track replay also comes through
+// `XCTrack.getLocation()`. So as soon as `window.XCTrack` exists the widget waits
+// for that bridge to produce a valid fix rather than reaching for the phone's own
+// geolocation, which would report the wrong position or none at all.
 
 import type { Config, Fix } from "./types";
 import { bearingDeg, haversineM } from "./geo";
@@ -13,6 +19,12 @@ export const TRACK_SPEED_THRESHOLD_KMH = 8;
 /** Assumed altitude for the ?lat=&lng= fallback, which reports no altitude. */
 export const STATIC_FALLBACK_ALT_M = 2000;
 
+/** How much of a raw payload the ?debug=1 corner shows. */
+export const RAW_DEBUG_CHARS = 120;
+
+/** Epoch timestamps below this are seconds, not milliseconds (year 5138 in ms). */
+const EPOCH_MS_FLOOR = 1e11;
+
 interface XCTrackBridge {
   getLocation?: () => string | null;
 }
@@ -20,8 +32,10 @@ interface XCTrackBridge {
 interface XCTrackLocation {
   lat?: number;
   lon?: number;
+  latitude?: number;
+  longitude?: number;
   time?: number;
-  altGps?: number;
+  altGps?: number | null;
   isValid?: boolean;
   stdBaroAlt?: number | null;
   pressure?: number | null;
@@ -40,48 +54,85 @@ export interface IgcFix {
   baroAlt: number;
 }
 
+/** What `?debug=1` shows, so a pilot can diagnose the source on the phone. */
+export interface LocationDebug {
+  source: LocationSourceName;
+  /** Last raw payload, truncated to RAW_DEBUG_CHARS. */
+  raw: string | null;
+  /** Valid fixes delivered so far. */
+  fixes: number;
+  /** Timestamp the payload itself reported, if any. Never used for staleness. */
+  reportedT: number | null;
+}
+
+export interface LocationHooks {
+  /** Which source won ('none' if the chosen one could produce nothing). */
+  onSource?: (name: LocationSourceName) => void;
+  /** Called on every poll, valid or not, when the caller wants diagnostics. */
+  onDebug?: (info: LocationDebug) => void;
+}
+
 /**
- * Start feeding fixes to `onFix` at roughly 1 Hz from the best available source.
- * `onSource` reports which source won (and 'none' if the chosen one produced
- * nothing). Returns a function that stops the source.
+ * Start feeding fixes to `onFix` at roughly 1 Hz from the single applicable
+ * source. Returns a function that stops it.
  */
 export function startLocationSource(
   cfg: Config,
   onFix: (fix: Fix) => void,
-  onSource?: (name: LocationSourceName) => void,
+  hooks?: LocationHooks,
 ): () => void {
   if (hasXCTrack()) {
-    onSource?.("xctrack");
-    return startXCTrack(cfg, onFix);
+    hooks?.onSource?.("xctrack");
+    return startXCTrack(onFix, hooks);
   }
   if (cfg.replay) {
-    onSource?.("replay");
-    return startReplay(cfg, onFix);
+    hooks?.onSource?.("replay");
+    return startReplay(cfg, onFix, hooks);
   }
   if (typeof navigator !== "undefined" && navigator.geolocation) {
-    onSource?.("geolocation");
-    return startGeolocation(cfg, onFix, () => onSource?.("static"));
+    hooks?.onSource?.("geolocation");
+    return startGeolocation(cfg, onFix, () => hooks?.onSource?.("static"));
   }
-  onSource?.(startStatic(cfg, onFix) ? "static" : "none");
+  hooks?.onSource?.(startStatic(cfg, onFix) ? "static" : "none");
   return () => {};
 }
 
-function hasXCTrack(): boolean {
+/**
+ * True whenever XCTrack injected its bridge, even if `getLocation` is missing or
+ * still answering "null": inside XCTrack no other source is admissible.
+ */
+export function hasXCTrack(): boolean {
   const bridge = (globalThis as { XCTrack?: XCTrackBridge }).XCTrack;
-  return typeof bridge?.getLocation === "function";
+  return typeof bridge === "object" && bridge !== null;
 }
 
-function startXCTrack(cfg: Config, onFix: (fix: Fix) => void): () => void {
+function startXCTrack(onFix: (fix: Fix) => void, hooks?: LocationHooks): () => void {
+  let fixes = 0;
+  let loggedFirst = false;
   const poll = (): void => {
     const bridge = (globalThis as { XCTrack?: XCTrackBridge }).XCTrack;
-    let raw: string | null = null;
+    let raw: unknown = null;
     try {
       raw = bridge?.getLocation?.() ?? null;
     } catch {
-      return;
+      raw = null;
     }
-    const fix = parseXCTrackLocation(raw, cfg);
-    if (fix) onFix(fix);
+    const text = typeof raw === "string" ? raw : raw === null ? "null" : JSON.stringify(raw);
+    if (!loggedFirst && raw !== null) {
+      loggedFirst = true;
+      console.log("[xsbt] first XCTrack.getLocation():", text);
+    }
+    const fix = parseXCTrackLocation(raw);
+    if (fix) {
+      fixes += 1;
+      onFix(fix);
+    }
+    hooks?.onDebug?.({
+      source: "xctrack",
+      raw: text.slice(0, RAW_DEBUG_CHARS),
+      fixes,
+      reportedT: fix?.reportedT ?? null,
+    });
   };
   poll();
   const timer = setInterval(poll, 1000);
@@ -90,49 +141,71 @@ function startXCTrack(cfg: Config, onFix: (fix: Fix) => void): () => void {
 
 /**
  * Turn one `XCTrack.getLocation()` payload into a Fix. The bridge hands back a
- * JSON string, the literal string "null", or null; an invalid or incomplete fix
- * yields null. Speeds are km/h, angles degrees true.
+ * JSON string, an already-parsed object, the literal string "null", or null; an
+ * invalid or incomplete fix yields null. Speeds are km/h per XCTrack's docs,
+ * angles degrees true.
+ *
+ * The Fix is timestamped `receivedAt`, not with the payload's own `time`: under
+ * XCTrack's track replay the payload reports the historical time of the recorded
+ * fix, and using that would make every fix look 30 s stale on arrival. The
+ * reported time is kept in `reportedT` for display only.
  */
-export function parseXCTrackLocation(raw: string | null, cfg: Config): Fix | null {
-  if (!raw || raw === "null") return null;
-  let loc: XCTrackLocation;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
-    loc = parsed as XCTrackLocation;
-  } catch {
-    return null;
-  }
-  if (loc.isValid === false) return null;
-  if (typeof loc.lat !== "number" || typeof loc.lon !== "number") return null;
+export function parseXCTrackLocation(raw: unknown, receivedAt: number = Date.now()): Fix | null {
+  const loc = asLocation(raw);
+  if (!loc) return null;
+  if (loc.isValid === false) return null; // a missing isValid counts as valid
 
-  const baro = typeof loc.stdBaroAlt === "number" ? loc.stdBaroAlt : null;
-  const gps = typeof loc.altGps === "number" ? loc.altGps : null;
-  const useBaro = cfg.alt === "baro" && baro !== null;
-  const alt = useBaro ? baro : (gps ?? baro);
+  const lat = firstNumber(loc.lat, loc.latitude);
+  const lon = firstNumber(loc.lon, loc.longitude);
+  if (lat === null || lon === null) return null;
+
+  // GPS altitude only; the barometer stands in when the GPS reports none.
+  const alt = firstNumber(loc.altGps, loc.stdBaroAlt);
   if (alt === null) return null;
 
   const speedKmh = firstNumber(loc.speedGps, loc.speedComputed) ?? 0;
-  const bearing = typeof loc.bearingGps === "number" ? loc.bearingGps : null;
-  const heading = typeof loc.heading === "number" ? loc.heading : null;
+  const bearing = firstNumber(loc.bearingGps);
+  const heading = firstNumber(loc.heading);
   const track = speedKmh > TRACK_SPEED_THRESHOLD_KMH ? (bearing ?? heading) : (heading ?? bearing);
 
   return {
-    lat: loc.lat,
-    lon: loc.lon,
+    lat,
+    lon,
     alt,
-    altSource: useBaro ? "baro" : "gps",
     speedKmh,
     track,
-    t: typeof loc.time === "number" && loc.time > 0 ? loc.time : Date.now(),
+    t: receivedAt,
+    reportedT: reportedTime(loc.time),
   };
 }
 
-function startReplay(cfg: Config, onFix: (fix: Fix) => void): () => void {
+function asLocation(raw: unknown): XCTrackLocation | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "object") return raw as XCTrackLocation;
+  if (typeof raw !== "string") return null;
+  const text = raw.trim();
+  if (text === "" || text === "null") return null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? (parsed as XCTrackLocation) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The payload's own timestamp in epoch ms, accepting epoch seconds too. */
+function reportedTime(time: unknown): number | null {
+  const t = firstNumber(time as number | null | undefined);
+  if (t === null || t <= 0) return null;
+  return t < EPOCH_MS_FLOOR ? t * 1000 : t;
+}
+
+function startReplay(cfg: Config, onFix: (fix: Fix) => void, hooks?: LocationHooks): () => void {
   const url = cfg.replay;
   const speed = cfg.speed > 0 ? cfg.speed : 1;
   let timer: ReturnType<typeof setInterval> | null = null;
   let cancelled = false;
+  let count = 0;
 
   if (url) {
     void fetch(url)
@@ -151,7 +224,15 @@ function startReplay(cfg: Config, onFix: (fix: Fix) => void): () => void {
           const virtual = first.t + elapsed;
           if (virtual < fixes[idx]!.t) idx = 0; // wrapped around, start the loop again
           while (idx + 1 < fixes.length && fixes[idx + 1]!.t <= virtual) idx += 1;
-          onFix(igcToFix(fixes, idx, cfg));
+          const fix = igcToFix(fixes, idx);
+          count += 1;
+          onFix(fix);
+          hooks?.onDebug?.({
+            source: "replay",
+            raw: `${url} fix ${idx + 1}/${fixes.length}`.slice(0, RAW_DEBUG_CHARS),
+            fixes: count,
+            reportedT: fix.reportedT ?? null,
+          });
         };
         tick();
         timer = setInterval(tick, 1000);
@@ -168,7 +249,7 @@ function startReplay(cfg: Config, onFix: (fix: Fix) => void): () => void {
 }
 
 /** Build a Fix from an IGC fix, taking speed and track from the preceding fix. */
-export function igcToFix(fixes: readonly IgcFix[], idx: number, cfg: Config): Fix {
+export function igcToFix(fixes: readonly IgcFix[], idx: number): Fix {
   const cur = fixes[idx]!;
   const prev = idx > 0 ? fixes[idx - 1]! : null;
   let speedKmh = 0;
@@ -179,15 +260,14 @@ export function igcToFix(fixes: readonly IgcFix[], idx: number, cfg: Config): Fi
     if (dt > 0) speedKmh = (d / dt) * 3.6;
     if (d > 1) track = bearingDeg(prev.lat, prev.lon, cur.lat, cur.lon);
   }
-  const useBaro = cfg.alt === "baro" && cur.baroAlt > 0;
   return {
     lat: cur.lat,
     lon: cur.lon,
-    alt: useBaro ? cur.baroAlt : cur.gpsAlt,
-    altSource: useBaro ? "baro" : "gps",
+    alt: cur.gpsAlt > 0 ? cur.gpsAlt : cur.baroAlt,
     speedKmh,
     track,
     t: Date.now(),
+    reportedT: cur.t,
   };
 }
 
@@ -268,7 +348,6 @@ function startGeolocation(
         lat: pos.coords.latitude,
         lon: pos.coords.longitude,
         alt: pos.coords.altitude ?? 0,
-        altSource: "gps",
         speedKmh: (pos.coords.speed ?? 0) * 3.6,
         track: pos.coords.heading ?? null,
         t: pos.timestamp,
@@ -298,7 +377,6 @@ function startStatic(_cfg: Config, onFix: (fix: Fix) => void): boolean {
     lat: pos.lat,
     lon: pos.lon,
     alt: STATIC_FALLBACK_ALT_M,
-    altSource: "gps",
     speedKmh: 0,
     track: null,
     t: Date.now(),

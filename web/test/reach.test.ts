@@ -11,7 +11,6 @@ const fix: Fix = {
   lat: 46.7,
   lon: 7.9,
   alt: 2000,
-  altSource: "gps",
   speedKmh: 35,
   track: 90,
   t: NOW,

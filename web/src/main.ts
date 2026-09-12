@@ -17,7 +17,12 @@ import { loadStops, type StopIndex } from "./stops";
 import { loadTable, type TravelTable } from "./table";
 import { createTransportClient, type TransportClient } from "./transport";
 import { parseHHMM } from "./time";
-import { startLocationSource } from "./xctrack";
+import {
+  RAW_DEBUG_CHARS,
+  startLocationSource,
+  type LocationDebug,
+  type LocationSourceName,
+} from "./xctrack";
 import type { Candidate, Config, Fix, Journey, RenderModel, Stop } from "./types";
 
 /** Horizontal movement since the last routing cycle that forces a new one. */
@@ -46,6 +51,7 @@ function start(): Loop {
   svg.style.display = "block";
   host.appendChild(svg);
 
+  const debugBox = cfg0.debug ? createDebugBox(host) : null;
   const overlay = createOverlay(host, () => draw());
   svg.addEventListener("click", (e) => {
     const target = e.target as Element | null;
@@ -66,6 +72,7 @@ function start(): Loop {
         h = box.height;
       }
     }
+    overlay.sync();
     draw();
   });
   ro.observe(host);
@@ -78,6 +85,8 @@ function start(): Loop {
   let client: TransportClient | null = null;
 
   let fix: Fix | null = null;
+  /** Which location source is running; it decides the "waiting" wording. */
+  let source: LocationSourceName = "none";
   let candidates: Candidate[] = [];
   let journeys: Map<number, Journey> = new Map();
   let model: RenderModel = idleModel(cfg0, "loading stops…");
@@ -101,7 +110,7 @@ function start(): Loop {
       return;
     }
     if (!fix || !stops) {
-      model = idleModel(cfg, fix ? "loading stops…" : "waiting for GPS");
+      model = idleModel(cfg, fix ? "loading stops…" : waitingMessage(source));
       draw();
       return;
     }
@@ -139,7 +148,6 @@ function start(): Loop {
       ageSec: cycleAt ? (now - cycleAt) / 1000 : null,
       stale: client ? client.isStale() : false,
       offline,
-      altSource: fix.altSource,
       theme: cfg.mode,
       noFix: false,
       message: null,
@@ -190,11 +198,21 @@ function start(): Loop {
 
   draw();
 
-  const stopSource = startLocationSource(cfg0, (f) => {
-    fix = f;
-    recompute();
-    maybeCycle();
-  });
+  const stopSource = startLocationSource(
+    cfg0,
+    (f) => {
+      fix = f;
+      recompute();
+      maybeCycle();
+    },
+    {
+      onSource: (name) => {
+        source = name;
+        if (!fix) recompute();
+      },
+      ...(debugBox ? { onDebug: debugBox.update } : {}),
+    },
+  );
 
   const ticker = window.setInterval(() => {
     recompute();
@@ -227,6 +245,46 @@ function start(): Loop {
       stopSource();
       window.clearInterval(ticker);
       overlay.destroy();
+      debugBox?.destroy();
+    },
+  };
+}
+
+/**
+ * Wording of the no-fix state. Inside XCTrack the bridge is the only source, so
+ * the message names it: the pilot's phone GPS is not going to rescue the widget.
+ */
+function waitingMessage(source: LocationSourceName): string {
+  return source === "xctrack" ? "waiting for XCTrack GPS" : "waiting for GPS";
+}
+
+interface DebugBox {
+  update(info: LocationDebug): void;
+  destroy(): void;
+}
+
+/**
+ * The ?debug=1 corner: source name, fix count and the last raw payload, so a
+ * pilot can tell "no GPS" apart from "bridge says something we cannot parse"
+ * on the phone, with no console.
+ */
+function createDebugBox(host: HTMLElement): DebugBox {
+  const box = host.ownerDocument.createElement("div");
+  box.style.cssText =
+    "position:absolute;left:0;bottom:0;z-index:20;max-width:100%;padding:2px 4px;" +
+    "background:rgba(0,0,0,.72);color:#FCBB00;font:11px/1.25 ui-monospace,Menlo,Consolas,monospace;" +
+    "white-space:pre-wrap;word-break:break-all;pointer-events:none";
+  box.textContent = "debug: waiting…";
+  host.appendChild(box);
+  return {
+    update(info: LocationDebug): void {
+      const reported = info.reportedT ? new Date(info.reportedT).toISOString().slice(11, 19) : "—";
+      box.textContent =
+        `${info.source} · fixes ${info.fixes} · t ${reported}\n` +
+        (info.raw ?? "—").slice(0, RAW_DEBUG_CHARS);
+    },
+    destroy(): void {
+      box.remove();
     },
   };
 }
@@ -242,7 +300,6 @@ function idleModel(cfg: Config, message: string): RenderModel {
     ageSec: null,
     stale: false,
     offline: false,
-    altSource: cfg.alt,
     theme: cfg.mode,
     noFix: true,
     message,

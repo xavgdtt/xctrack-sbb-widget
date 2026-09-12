@@ -1,8 +1,16 @@
 // In-widget settings overlay: plain DOM, absolutely positioned over the SVG.
 // XCTrack's web widget only becomes interactive after a long press, so ordinary
-// click handlers are enough; every control is at least 44 px tall for gloves.
+// click handlers are enough.
+//
+// The look follows render.ts rather than the web: the same black/white grounds,
+// the same font stack and tracking, SBB red used only for the selected option and
+// the close bar, SBB greys for everything else, hairline rules instead of cards,
+// and square-ish corners. Sizes scale from min(w, h) exactly as the SVG does, so
+// the four rows fit a 360x160 widget without scrolling while each stays at least
+// MIN_TOUCH px tall.
 
 import { defaultHomeBy, getConfig, updateSettings } from "./config";
+import { FONT_STACK } from "./render";
 import { formatHHMM, parseHHMM, roundToMinutes } from "./time";
 import type { Config } from "./types";
 
@@ -12,7 +20,7 @@ export interface Overlay {
   close(): void;
   toggle(): void;
   isOpen(): boolean;
-  /** Re-read the config and repaint the controls (call after an external change). */
+  /** Re-read the config and size and repaint (call after an external change). */
   sync(): void;
   destroy(): void;
 }
@@ -20,44 +28,73 @@ export interface Overlay {
 const STEP_MIN = 15;
 
 /** Minimum touch target, per the platform guidelines and cold fingers. */
-const TOUCH = 44;
+const MIN_TOUCH = 40;
 
-function css(theme: "dark" | "light"): string {
-  // SBB palette: red accent, black/white grounds, SBB greys.
+const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+
+/** The type ramp, derived from the widget's short side like render.ts does. */
+interface Metrics {
+  labelF: number;
+  btnF: number;
+  timeF: number;
+  pad: number;
+  gap: number;
+  labelW: number;
+  stepW: number;
+}
+
+function metrics(w: number, h: number): Metrics {
+  const s = Math.max(80, Math.min(w, h));
+  const labelF = clamp(s * 0.062, 7, 14);
+  return {
+    labelF,
+    btnF: clamp(s * 0.085, 10, 18),
+    timeF: clamp(s * 0.14, 14, 30),
+    pad: Math.max(3, s * 0.032),
+    gap: Math.max(3, s * 0.022),
+    labelW: Math.round(labelF * 6.6),
+    stepW: Math.round(clamp(w * 0.16, MIN_TOUCH + 6, 96)),
+  };
+}
+
+function css(theme: "dark" | "light", m: Metrics): string {
+  // The render.ts palette, so the overlay and the widget are the same object.
   const dark = theme !== "light";
   const bg = dark ? "#000000" : "#FFFFFF";
   const fg = dark ? "#FFFFFF" : "#000000";
+  const muted = dark ? "#B7B7B7" : "#666969";
   const rule = dark ? "#444444" : "#D2D2D2";
-  const chip = dark ? "#212121" : "#F6F6F6";
   const accent = "#EB0000";
-  const on = accent;
-  const onFg = "#FFFFFF";
+  const r1 = (v: number): string => (Math.round(v * 10) / 10).toString();
   return `
 .xsbt-ov{position:absolute;inset:0;z-index:10;background:${bg};color:${fg};
-  font:600 16px/1.25 "SBB","Helvetica Neue",Helvetica,Arial,system-ui,sans-serif;letter-spacing:-.012em;
-  overflow:auto;overscroll-behavior:contain;-webkit-tap-highlight-color:transparent}
+  font:700 ${r1(m.btnF)}px/1.2 ${FONT_STACK};letter-spacing:-.012em;
+  overflow:hidden;overscroll-behavior:contain;-webkit-tap-highlight-color:transparent}
 .xsbt-ov *{box-sizing:border-box}
-.xsbt-in{padding:10px 12px 14px;display:flex;flex-direction:column;gap:8px;max-width:560px;margin:0 auto}
-.xsbt-row{display:flex;align-items:center;gap:8px}
-.xsbt-lab{flex:0 0 auto;min-width:72px;font-size:13px;font-weight:700;letter-spacing:.06em;
-  text-transform:uppercase;opacity:.65}
-.xsbt-seg{display:flex;flex:1 1 auto;gap:6px}
-.xsbt-btn{flex:1 1 0;min-height:${TOUCH}px;min-width:${TOUCH}px;border:2px solid ${rule};border-radius:8px;
-  background:${chip};color:${fg};font:inherit;font-size:16px;cursor:pointer;padding:0 8px;
-  display:flex;align-items:center;justify-content:center;user-select:none}
-.xsbt-btn[aria-pressed="true"]{background:${on};border-color:${on};color:${onFg}}
-.xsbt-btn:active{border-color:#C60018}
-.xsbt-btn:disabled{opacity:.35;cursor:default}
-.xsbt-time{flex:1 1 auto;text-align:center;font-size:26px;font-weight:800;font-variant-numeric:tabular-nums}
-.xsbt-step{flex:0 0 ${TOUCH + 16}px}
-.xsbt-close{position:sticky;bottom:0;min-height:${TOUCH}px;margin-top:4px;border:2px solid ${accent};
-  border-radius:8px;background:${accent};color:#FFFFFF;font:inherit;font-size:17px;font-weight:700;cursor:pointer}
+.xsbt-in{display:flex;flex-direction:column;height:100%}
+.xsbt-row{flex:1 1 0;min-height:${MIN_TOUCH}px;display:flex;align-items:stretch}
+/* An inset shadow, not a border: the rule must not eat a pixel of the 40 px row. */
+.xsbt-row+.xsbt-row{box-shadow:inset 0 1px 0 ${rule}}
+.xsbt-lab{flex:0 0 ${m.labelW}px;display:flex;align-items:center;white-space:nowrap;
+  padding-left:${r1(m.pad)}px;
+  color:${muted};font-size:${r1(m.labelF)}px;font-weight:800;letter-spacing:.11em;
+  text-transform:uppercase}
+/* Options are full-height cells split by hairlines, like the widget's cell dividers:
+   no pills, no cards, and the whole cell is the touch target. */
+.xsbt-btn{flex:1 1 0;border:0;border-left:1px solid ${rule};border-radius:0;
+  background:transparent;color:${muted};font:inherit;font-size:${r1(m.btnF)}px;
+  letter-spacing:.06em;text-transform:uppercase;cursor:pointer;padding:0 ${r1(m.gap)}px;
+  display:flex;align-items:center;justify-content:center;user-select:none;white-space:nowrap}
+.xsbt-btn[aria-pressed="true"]{background:${accent};color:#FFFFFF}
+.xsbt-step{flex:0 0 ${m.stepW}px;font-variant-numeric:tabular-nums}
+.xsbt-time{flex:1 1 auto;border-left:1px solid ${rule};display:flex;align-items:center;
+  justify-content:center;color:${fg};font-size:${r1(m.timeF)}px;font-weight:800;
+  font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.xsbt-dim{opacity:.38}
+.xsbt-close{flex:0 0 ${MIN_TOUCH}px;min-height:${MIN_TOUCH}px;border:0;border-radius:0;
+  background:${accent};color:#FFFFFF;font:inherit;font-size:${r1(m.btnF)}px;font-weight:800;
+  letter-spacing:.11em;text-transform:uppercase;cursor:pointer}
 .xsbt-hide{display:none}
-/* Short widgets cannot fit five 44 px rows; the panel scrolls and Close stays pinned. */
-@media (max-height:280px){
-  .xsbt-in{padding:6px 10px 8px;gap:6px}
-  .xsbt-time{font-size:22px}
-}
 `;
 }
 
@@ -81,7 +118,8 @@ export function createOverlay(host: HTMLElement, onChange?: (cfg: Config) => voi
   root.append(style, inner);
   host.appendChild(root);
 
-  let theme: "dark" | "light" | null = null;
+  /** Theme + size the current stylesheet was written for. */
+  let styledFor: string | null = null;
   /** Home-by target as epoch ms while the overlay is open; null until first used. */
   let homeByMs: number | null = null;
 
@@ -108,14 +146,12 @@ export function createOverlay(host: HTMLElement, onChange?: (cfg: Config) => voi
     const lab = doc.createElement("div");
     lab.className = "xsbt-lab";
     lab.textContent = label;
-    const seg = doc.createElement("div");
-    seg.className = "xsbt-seg";
+    row.appendChild(lab);
     const buttons = segs.map((s) => {
       const b = button(s.label, () => apply(s.value));
-      seg.appendChild(b);
+      row.appendChild(b);
       return b;
     });
-    row.append(lab, seg);
     return {
       row,
       paint: (active: T) => {
@@ -162,26 +198,17 @@ export function createOverlay(host: HTMLElement, onChange?: (cfg: Config) => voi
     (v) => commit({ arrow: v }),
   );
 
-  const alt = segRow(
-    "altitude",
-    [
-      { value: "gps", label: "GPS" },
-      { value: "baro", label: "baro" },
-    ] as const,
-    (v) => commit({ alt: v }),
-  );
-
   const close = doc.createElement("button");
   close.type = "button";
   close.className = "xsbt-close";
-  close.textContent = "Close";
+  close.textContent = "close";
   close.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
     api.close();
   });
 
-  inner.append(mode.row, timeRow, arrow.row, alt.row, close);
+  inner.append(mode.row, timeRow, arrow.row, close);
 
   function nudge(deltaMin: number): void {
     const base = homeByMs ?? parseHHMM(getConfig().homeBy ?? defaultHomeBy()) ?? Date.now();
@@ -196,25 +223,24 @@ export function createOverlay(host: HTMLElement, onChange?: (cfg: Config) => voi
   }
 
   function paint(cfg: Config): void {
-    if (theme !== cfg.mode) {
-      theme = cfg.mode;
-      style.textContent = css(cfg.mode);
+    const w = host.clientWidth || root.clientWidth || 360;
+    const h = host.clientHeight || root.clientHeight || 160;
+    const key = `${cfg.mode}|${Math.round(w)}x${Math.round(h)}`;
+    if (styledFor !== key) {
+      styledFor = key;
+      style.textContent = css(cfg.mode, metrics(w, h));
     }
     mode.paint(cfg.rankMode);
     arrow.paint(cfg.arrow);
-    alt.paint(cfg.alt);
-    const homeBy = cfg.homeBy ?? defaultHomeBy();
-    timeVal.textContent = homeBy;
-    const active = cfg.rankMode === "homeBy";
-    timeRow.style.opacity = active ? "1" : "0.45";
-    minus.disabled = false;
-    plus.disabled = false;
+    timeVal.textContent = cfg.homeBy ?? defaultHomeBy();
+    timeRow.classList.toggle("xsbt-dim", cfg.rankMode !== "homeBy");
   }
 
   const api: Overlay = {
     open(): void {
       paint(getConfig());
       root.classList.remove("xsbt-hide");
+      paint(getConfig()); // now that it is laid out, the measured size is real
     },
     close(): void {
       root.classList.add("xsbt-hide");
@@ -228,7 +254,7 @@ export function createOverlay(host: HTMLElement, onChange?: (cfg: Config) => voi
     },
     sync(): void {
       if (api.isOpen()) paint(getConfig());
-      else theme = null;
+      else styledFor = null;
     },
     destroy(): void {
       root.remove();

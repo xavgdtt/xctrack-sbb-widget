@@ -587,7 +587,6 @@ export function footerParts(model: RenderModel, pal: Palette): FooterPart[] {
   if (model.stale) parts.push({ t: age ? "STALE " + age : "STALE", c: pal.stale });
   else if (age) parts.push({ t: "age " + age, c: pal.muted });
   if (model.offline) parts.push({ t: "OFFLINE", c: pal.stale });
-  parts.push({ t: model.altSource.toUpperCase(), c: pal.muted });
   if (model.homeByLabel) parts.push({ t: model.homeByLabel, c: pal.accent });
   return parts;
 }

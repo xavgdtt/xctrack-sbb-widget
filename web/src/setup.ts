@@ -6,7 +6,6 @@ import { renderQrCode } from "./qr";
 
 /*---- Config defaults (must match web/src/config.ts / IMPLEMENTATION_PLAN.md 4.2) ----*/
 
-type Alt = "gps" | "baro";
 type ThemeMode = "dark" | "light";
 type Arrow = "heading" | "north";
 type RankMode = "earliest" | "homeBy";
@@ -18,7 +17,6 @@ interface Defaults {
   margin: number;
   lmax: number;
   lsafe: number;
-  alt: Alt;
   mode: ThemeMode;
   refresh: number;
   maxRoute: number;
@@ -33,7 +31,6 @@ const DEFAULTS: Defaults = {
   margin: 150,
   lmax: 15,
   lsafe: 6,
-  alt: "gps",
   mode: "dark",
   refresh: 120,
   maxRoute: 8,
@@ -61,7 +58,6 @@ const inputs = {
   margin: el<HTMLInputElement>("cfg-margin"),
   lmax: el<HTMLInputElement>("cfg-lmax"),
   lsafe: el<HTMLInputElement>("cfg-lsafe"),
-  alt: el<HTMLSelectElement>("cfg-alt"),
   mode: el<HTMLSelectElement>("cfg-mode"),
   refresh: el<HTMLInputElement>("cfg-refresh"),
   maxRoute: el<HTMLInputElement>("cfg-maxRoute"),
@@ -233,7 +229,6 @@ function initDefaults(): void {
   inputs.margin.value = String(DEFAULTS.margin);
   inputs.lmax.value = String(DEFAULTS.lmax);
   inputs.lsafe.value = String(DEFAULTS.lsafe);
-  inputs.alt.value = DEFAULTS.alt;
   inputs.mode.value = DEFAULTS.mode;
   inputs.refresh.value = String(DEFAULTS.refresh);
   inputs.maxRoute.value = String(DEFAULTS.maxRoute);
@@ -283,7 +278,6 @@ function buildWidgetUrl(): URL | null {
   if (Number.isFinite(lmax) && lmax !== DEFAULTS.lmax) params.set("lmax", String(lmax));
   const lsafe = Number(inputs.lsafe.value);
   if (Number.isFinite(lsafe) && lsafe !== DEFAULTS.lsafe) params.set("lsafe", String(lsafe));
-  if (inputs.alt.value !== DEFAULTS.alt) params.set("alt", inputs.alt.value);
   if (inputs.mode.value !== DEFAULTS.mode) params.set("mode", inputs.mode.value);
   const refresh = Number(inputs.refresh.value);
   if (Number.isFinite(refresh) && refresh !== DEFAULTS.refresh) params.set("refresh", String(refresh));

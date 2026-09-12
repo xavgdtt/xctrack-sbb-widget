@@ -10,7 +10,6 @@ export interface Settings {
   rankMode: Mode;
   homeBy: string | null;
   arrow: "heading" | "north";
-  alt: "gps" | "baro";
 }
 
 export const CONFIG_KEY = "xsbt.config";
@@ -25,7 +24,6 @@ export const DEFAULTS: Config = {
   margin: 150,
   lmax: 15,
   lsafe: 6,
-  alt: "gps",
   mode: "dark",
   refresh: 120,
   maxRoute: 8,
@@ -34,9 +32,10 @@ export const DEFAULTS: Config = {
   homeBy: null,
   replay: null,
   speed: 1,
+  debug: false,
 };
 
-const SETTINGS_KEYS: readonly (keyof Settings)[] = ["rankMode", "homeBy", "arrow", "alt"];
+const SETTINGS_KEYS: readonly (keyof Settings)[] = ["rankMode", "homeBy", "arrow"];
 
 let current: Config = { ...DEFAULTS };
 let base: Config = { ...DEFAULTS };
@@ -152,8 +151,8 @@ function coerce(raw: Record<string, unknown>): Partial<Config> {
     const n = num(raw[key]);
     if (n !== null && n > 0) (out as Record<string, unknown>)[key] = n;
   }
-  const alt = oneOf(raw["alt"], ["gps", "baro"] as const);
-  if (alt) out.alt = alt;
+  // `alt` (the old GPS/baro altitude-source setting) is accepted and ignored, so
+  // URLs built before the widget settled on GPS altitude still load.
   const mode = oneOf(raw["mode"], ["dark", "light"] as const);
   if (mode) out.mode = mode;
   const arrow = oneOf(raw["arrow"], ["heading", "north"] as const);
@@ -168,6 +167,8 @@ function coerce(raw: Record<string, unknown>): Partial<Config> {
   if (typeof raw["replay"] === "string" && raw["replay"] !== "") {
     out.replay = raw["replay"];
   }
+  const debug = raw["debug"];
+  if (debug === true || debug === "1" || debug === "true") out.debug = true;
   return out;
 }
 

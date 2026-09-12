@@ -40,7 +40,7 @@ describe("parseQuery", () => {
   it("reads every documented parameter", () => {
     const cfg = parseQuery(
       "?home=8507000&homeName=Bern&v=38&pack=12&walk=7&margin=200&lmax=12&lsafe=5" +
-        "&alt=baro&mode=light&refresh=60&maxRoute=6&arrow=north&rankMode=homeBy" +
+        "&alt=baro&debug=1&mode=light&refresh=60&maxRoute=6&arrow=north&rankMode=homeBy" +
         "&homeBy=19:30&replay=fixtures/flight.igc&speed=20",
     );
     expect(cfg).toEqual({
@@ -52,7 +52,7 @@ describe("parseQuery", () => {
       margin: 200,
       lmax: 12,
       lsafe: 5,
-      alt: "baro",
+      debug: true,
       mode: "light",
       refresh: 60,
       maxRoute: 6,

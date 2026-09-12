@@ -5,10 +5,12 @@ export interface Fix {
   lat: number;
   lon: number;
   alt: number;
-  altSource: "baro" | "gps";
   speedKmh: number;
   track: number | null /* deg, bearingGps if moving else heading, null if unknown */;
-  t: number /* epoch ms */;
+  t: number /* epoch ms, when the fix was RECEIVED (wall clock), so staleness
+                works under a replay that reports historical timestamps */;
+  /** The timestamp the source itself reported, if any. Display/debug only. */
+  reportedT?: number | null;
 }
 export interface Stop {
   id: number;
@@ -54,7 +56,6 @@ export interface Config {
   margin: number;
   lmax: number;
   lsafe: number;
-  alt: "gps" | "baro";
   mode: "dark" | "light";
   refresh: number;
   maxRoute: number;
@@ -63,6 +64,8 @@ export interface Config {
   homeBy: string | null /* 'HH:MM' */;
   replay: string | null;
   speed: number;
+  /** ?debug=1: draw the location-source diagnostics corner. */
+  debug: boolean;
 }
 export interface RenderModel {
   picks: Pick[];
@@ -73,7 +76,6 @@ export interface RenderModel {
   ageSec: number | null;
   stale: boolean;
   offline: boolean;
-  altSource: "gps" | "baro";
   theme: "dark" | "light";
   noFix: boolean;
   message: string | null /* big centered text e.g. 'waiting for GPS' */;

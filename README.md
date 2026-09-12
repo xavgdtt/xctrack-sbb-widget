@@ -92,6 +92,16 @@ stop with the most flying time left rather than the earliest arrival. The budget
 turns red under 15 minutes. If no stop can make the deadline, ranking falls back to
 earliest mode silently and the widget shows that fallback happened.
 
+**Location source.** As soon as XCTrack injects its `window.XCTrack` bridge, that bridge
+is the only source of position: XCTrack may be fed by an external vario or by its own
+track replay, so the phone's `navigator.geolocation` would report the wrong place or
+nothing at all. Until the bridge returns a valid fix the widget shows
+`waiting for XCTrack GPS`. Geolocation is used only outside XCTrack, and only when no
+`replay` parameter is given. A fix is aged from the wall-clock moment it arrived, not
+from the timestamp it carries, so a replay of a recorded flight is not immediately
+"GPS lost". Adding `?debug=1` to the widget URL draws a corner showing the active source,
+the number of fixes received and the last raw payload.
+
 **Arrow orientation.** Each pick's direction arrow is drawn either heading-up (rotated
 against the aircraft's current track, from GPS speed/bearing or the compass heading when
 too slow to trust GPS course) or north-up. This is a gear setting, not a URL parameter.
@@ -109,8 +119,9 @@ and shows an `OFFLINE` marker instead.
   stop's elevation, ignoring ridges and valleys in between.
 - transport.opendata.ch is rate-limited to roughly 3 requests/second; a `429` response
   is handled with a 30-second backoff before the widget asks the API again.
-- Altitude in baro mode uses XCTrack's `stdBaroAlt`, which is the standard (QNE)
-  pressure altitude referenced to 1013.25 hPa, not a true or QNH-corrected altitude.
+- Altitude is always GPS altitude (`altGps`). Only when XCTrack reports none does the
+  widget fall back to `stdBaroAlt`, which is the standard (QNE) pressure altitude
+  referenced to 1013.25 hPa, not a true or QNH-corrected altitude.
 
 ## Setup in XCTrack
 
@@ -119,7 +130,7 @@ and shows an `OFFLINE` marker instead.
 2. Search for the home station by name and pick it from the results; the search calls
    `transport.opendata.ch/v1/locations` directly.
 3. Adjust parameters as needed: trim speed, packing/walking minutes, safety margin,
-   max/safe glide ratio, altitude source (GPS or baro), theme, refresh interval, routed
+   max/safe glide ratio, theme, refresh interval, routed
    stop count, arrow orientation, and ranking mode (earliest, or home-by with a
    quarter-hour-stepped target time). Every field updates the URL preview live.
 4. Copy the generated URL, or scan the QR code with the phone running XCTrack. "Test in
@@ -128,8 +139,8 @@ and shows an `OFFLINE` marker instead.
 5. In XCTrack, add a **Web page widget** (PRO) to a flight page and paste the URL.
 6. In flight, the widget is read-only until you long-press it — XCTrack's web widget
    only becomes interactive after a long press — after which the gear icon opens the
-   in-widget settings overlay to change mode, home-by time, arrow orientation, and
-   altitude source without leaving the flight page.
+   in-widget settings overlay to change mode, home-by time and arrow orientation
+   without leaving the flight page.
 
 ## Data
 

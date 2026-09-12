@@ -1,11 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { hasXCTrack, igcToFix, parseIGC, parseXCTrackLocation, startLocationSource } from "../src/xctrack";
 import { DEFAULTS } from "../src/config";
-import { igcToFix, parseIGC, parseXCTrackLocation } from "../src/xctrack";
 import type { Config } from "../src/types";
 
 const cfg: Config = { ...DEFAULTS, home: 8507000 };
-const baroCfg: Config = { ...cfg, alt: "baro" };
 
 describe("parseXCTrackLocation", () => {
   const loc = {
@@ -21,38 +20,96 @@ describe("parseXCTrackLocation", () => {
   };
 
   it("handles the no-fix payloads", () => {
-    expect(parseXCTrackLocation("null", cfg)).toBeNull();
-    expect(parseXCTrackLocation(null, cfg)).toBeNull();
-    expect(parseXCTrackLocation("{ not json", cfg)).toBeNull();
-    expect(parseXCTrackLocation(JSON.stringify({ ...loc, isValid: false }), cfg)).toBeNull();
+    expect(parseXCTrackLocation("null")).toBeNull();
+    expect(parseXCTrackLocation(null)).toBeNull();
+    expect(parseXCTrackLocation("{ not json")).toBeNull();
+    expect(parseXCTrackLocation(JSON.stringify({ ...loc, isValid: false }))).toBeNull();
   });
 
-  it("uses GPS altitude by default and barometric altitude on request", () => {
-    expect(parseXCTrackLocation(JSON.stringify(loc), cfg)).toMatchObject({
-      alt: 2000,
-      altSource: "gps",
-      t: loc.time,
-    });
-    expect(parseXCTrackLocation(JSON.stringify(loc), baroCfg)).toMatchObject({
-      alt: 1950,
-      altSource: "baro",
+  it("accepts an already-parsed object as well as a JSON string", () => {
+    expect(parseXCTrackLocation(loc)).toMatchObject({ lat: 46.7, lon: 7.9, alt: 2000 });
+    expect(parseXCTrackLocation(JSON.stringify(loc))).toMatchObject({ lat: 46.7, lon: 7.9 });
+  });
+
+  it("treats a missing isValid as valid and reads latitude/longitude aliases", () => {
+    const { lat, lon, isValid, ...rest } = loc;
+    expect(parseXCTrackLocation({ ...rest, latitude: lat, longitude: lon })).toMatchObject({
+      lat: 46.7,
+      lon: 7.9,
     });
   });
 
-  it("falls back to GPS altitude when the barometer reports nothing", () => {
-    const raw = JSON.stringify({ ...loc, stdBaroAlt: null });
-    expect(parseXCTrackLocation(raw, baroCfg)).toMatchObject({ alt: 2000, altSource: "gps" });
+  it("always uses GPS altitude, falling back to the barometer when it is missing", () => {
+    expect(parseXCTrackLocation(loc)).toMatchObject({ alt: 2000 });
+    expect(parseXCTrackLocation({ ...loc, altGps: null })).toMatchObject({ alt: 1950 });
+    expect(parseXCTrackLocation({ ...loc, altGps: null, stdBaroAlt: null })).toBeNull();
+  });
+
+  it("timestamps the fix on arrival and keeps the reported time, in ms or seconds", () => {
+    const received = 1_800_000_000_000;
+    expect(parseXCTrackLocation(loc, received)).toMatchObject({
+      t: received,
+      reportedT: loc.time,
+    });
+    // A replay reports a historical time; it must not make the fix look stale.
+    const seconds = parseXCTrackLocation({ ...loc, time: 1_600_000_000 }, received);
+    expect(seconds).toMatchObject({ t: received, reportedT: 1_600_000_000_000 });
+    expect(parseXCTrackLocation({ ...loc, time: undefined }, received)).toMatchObject({
+      t: received,
+      reportedT: null,
+    });
   });
 
   it("takes the track from the GPS course when moving and the compass when not", () => {
-    expect(parseXCTrackLocation(JSON.stringify(loc), cfg)!.track).toBe(210);
-    const slow = JSON.stringify({ ...loc, speedGps: 3 });
-    expect(parseXCTrackLocation(slow, cfg)!.track).toBe(180);
+    expect(parseXCTrackLocation(loc)!.track).toBe(210);
+    expect(parseXCTrackLocation({ ...loc, speedGps: 3 })!.track).toBe(180);
   });
 
-  it("reports no track when neither course nor heading is known", () => {
-    const raw = JSON.stringify({ ...loc, bearingGps: null, heading: null });
-    expect(parseXCTrackLocation(raw, cfg)!.track).toBeNull();
+  it("reports no track and no speed when the payload carries neither", () => {
+    const raw = { ...loc, bearingGps: null, heading: null, speedGps: null, speedComputed: null };
+    const fix = parseXCTrackLocation(raw)!;
+    expect(fix.track).toBeNull();
+    expect(fix.speedKmh).toBe(0);
+    expect(parseXCTrackLocation({ ...loc, speedGps: Number.NaN })!.speedKmh).toBe(0);
+  });
+});
+
+describe("startLocationSource", () => {
+  const withBridge = <T>(bridge: unknown, body: () => T): T => {
+    const g = globalThis as { XCTrack?: unknown };
+    const had = "XCTrack" in g;
+    const prev = g.XCTrack;
+    g.XCTrack = bridge;
+    try {
+      return body();
+    } finally {
+      if (had) g.XCTrack = prev;
+      else delete g.XCTrack;
+    }
+  };
+
+  it("uses XCTrack exclusively once the bridge exists, even with no valid fix", () => {
+    withBridge({ getLocation: () => "null" }, () => {
+      expect(hasXCTrack()).toBe(true);
+      const seen: string[] = [];
+      const fixes: unknown[] = [];
+      const stop = startLocationSource({ ...cfg, replay: "fixtures/flight.igc" }, (f) => fixes.push(f), {
+        onSource: (name) => seen.push(name),
+      });
+      stop();
+      expect(seen).toEqual(["xctrack"]); // never "geolocation", never "replay"
+      expect(fixes).toEqual([]);
+    });
+  });
+
+  it("reports the raw payload and the fix count for the ?debug=1 corner", () => {
+    const payload = JSON.stringify({ lat: 46.7, lon: 7.9, altGps: 2000 });
+    withBridge({ getLocation: () => payload }, () => {
+      const debug: { source: string; raw: string | null; fixes: number }[] = [];
+      const stop = startLocationSource(cfg, () => {}, { onDebug: (d) => debug.push(d) });
+      stop();
+      expect(debug[0]).toMatchObject({ source: "xctrack", raw: payload, fixes: 1 });
+    });
   });
 });
 
@@ -109,13 +166,12 @@ describe("igcToFix", () => {
         "B1215054642100N00748000EA0157001605",
       ].join("\n"),
     );
-    const first = igcToFix(fixes, 0, cfg);
+    const first = igcToFix(fixes, 0);
     expect(first.speedKmh).toBe(0);
     expect(first.track).toBeNull();
-    const second = igcToFix(fixes, 1, cfg);
+    const second = igcToFix(fixes, 1);
     expect(second.track).toBeCloseTo(0, 1); // due north
     expect(second.speedKmh).toBeCloseTo((185 / 5) * 3.6, 0);
-    expect(second.alt).toBe(1605);
-    expect(igcToFix(fixes, 1, baroCfg).alt).toBe(1570);
+    expect(second.alt).toBe(1605); // GPS altitude, always
   });
 });
