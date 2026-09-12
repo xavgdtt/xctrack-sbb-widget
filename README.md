@@ -112,6 +112,21 @@ offline: it still ranks stops using the cached Phase 2 travel-time table (or the
 heuristic if no table is loaded) but drops departure and arrival times from each cell
 and shows an `OFFLINE` marker instead.
 
+**Service worker.** `web/src/sw.ts` is built to `sw.js` at the site root and caches under
+the name `xsbt-<app build id>-<dataset build id>`. The app build id is the git commit SHA
+(`GITHUB_SHA` in CI), so every deploy produces a different `sw.js`, a different cache, and
+an update the browser actually notices; the dataset build id is in the name too, so a
+republished `stops.json` invalidates the cache on its own. Requests are routed by
+`strategyFor` in `sw-route.ts`: navigations and `*.html` are network-first with the cached
+copy as the offline fallback, hashed files under `assets/` and the `data/` JSON are
+cache-first (a new cache per build makes them fresh after a deploy), `data/tables/*.bin[.gz]`
+are cache-first out of a separate cache that survives deploys and is revalidated weekly, and
+`sw.js` itself and cross-origin requests are not intercepted. When a new worker activates it
+deletes the old caches, claims the open pages and posts `{type:"xsbt-updated"}` to them;
+`main.ts` reloads once on that message (guarded by a `sessionStorage` flag) and calls
+`registration.update()` on load and every six hours, so a widget XCTrack has kept open for a
+whole flying day still picks up a deploy without anyone touching it.
+
 **Limitations.**
 
 - No wind model.

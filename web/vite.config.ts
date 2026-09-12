@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vitest/config";
@@ -7,10 +8,10 @@ import { defineConfig } from "vitest/config";
 const base = process.env["BASE_PATH"] ?? "/";
 
 /**
- * Cache-busting id for the service worker. The dataset's own build id is the
- * right thing to key on: a new stops.json must invalidate every cached copy.
+ * Dataset build id: changes when the ETL republishes stops.json, and so must
+ * invalidate every cached copy of it.
  */
-function buildId(): string {
+function dataBuildId(): string {
   try {
     const meta = JSON.parse(
       readFileSync(resolve(import.meta.dirname, "public/data/meta.json"), "utf8"),
@@ -22,10 +23,31 @@ function buildId(): string {
   return `dev-${Date.now()}`;
 }
 
+/**
+ * App build id: changes on every deploy, which the dataset id does not. Without
+ * it sw.js stays byte-identical across deploys, the browser detects no update,
+ * and a widget in the field serves the old shell from cache forever.
+ */
+function appBuildId(): string {
+  const fromCi = process.env["GITHUB_SHA"];
+  if (fromCi) return fromCi.slice(0, 7);
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      cwd: import.meta.dirname,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    // No git (tarball export, shallow container): the clock at least changes.
+    return `t${Date.now()}`;
+  }
+}
+
 export default defineConfig({
   base,
   define: {
-    __BUILD_ID__: JSON.stringify(buildId()),
+    __DATA_BUILD_ID__: JSON.stringify(dataBuildId()),
+    __APP_BUILD_ID__: JSON.stringify(appBuildId()),
   },
   build: {
     rollupOptions: {

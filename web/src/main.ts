@@ -333,14 +333,43 @@ function isOffline(client: TransportClient | null, journeys: ReadonlyMap<number,
   return client.isStale() && journeys.size === 0;
 }
 
+/** How often an open widget asks the browser to re-check sw.js for a new deploy. */
+const SW_UPDATE_INTERVAL_MS = 6 * 3600_000;
+/** Set for the lifetime of the tab, so one deploy can only trigger one reload. */
+const RELOADED_KEY = "xsbt-reloaded-for";
+
 function registerServiceWorker(): void {
   if (!import.meta.env.PROD) return;
   if (!("serviceWorker" in navigator)) return;
+  // A new worker activates, claims this page and says so; the shell it would
+  // serve is now newer than the one running, so reload to pick it up. XCTrack
+  // keeps the widget open for hours, and nobody is there to press refresh.
+  navigator.serviceWorker.addEventListener("message", (event: MessageEvent) => {
+    const data = event.data as { type?: unknown; buildId?: unknown } | null;
+    if (!data || data.type !== "xsbt-updated") return;
+    const buildId = typeof data.buildId === "string" ? data.buildId : "";
+    try {
+      // Without this guard a worker that keeps re-activating would reload forever.
+      if (sessionStorage.getItem(RELOADED_KEY) === buildId) return;
+      sessionStorage.setItem(RELOADED_KEY, buildId);
+    } catch {
+      /* no sessionStorage: reload once and accept the small risk of a loop */
+    }
+    location.reload();
+  });
   window.addEventListener("load", () => {
     const url = new URL("sw.js", new URL(import.meta.env.BASE_URL, location.href));
-    void navigator.serviceWorker.register(url, { type: "module" }).catch(() => {
-      /* the widget works without it */
-    });
+    void navigator.serviceWorker
+      .register(url, { type: "module", updateViaCache: "none" })
+      .then((registration) => {
+        void registration.update().catch(() => {});
+        setInterval(() => {
+          void registration.update().catch(() => {});
+        }, SW_UPDATE_INTERVAL_MS);
+      })
+      .catch(() => {
+        /* the widget works without it */
+      });
   });
 }
 

@@ -1,22 +1,34 @@
 // Service worker. Built by Vite as a separate entry emitted at the site root as
-// `sw.js` (see vite.config.ts), with `__BUILD_ID__` replaced at build time so a
-// new dataset build invalidates the whole cache.
+// `sw.js` (see vite.config.ts), with `__APP_BUILD_ID__` and `__DATA_BUILD_ID__`
+// replaced at build time. The app id is the git commit SHA, so every deploy
+// produces a different sw.js and a different cache name; the dataset id is in
+// the name too, so a republished stops.json invalidates the cache on its own.
 //
-// Strategy:
-//   same-origin app shell + data  -> cache-first, filled on install and on use
-//   data/tables/*.bin[.gz]        -> cache-first, revalidated once a week
-//   transport.opendata.ch         -> not intercepted; the app layer owns offline
+// Strategy (see strategyFor in sw-route.ts):
+//   navigations and *.html          -> network-first, cached copy as fallback
+//   assets/<hashed>                 -> cache-first (immutable)
+//   data/stops.json[.gz], meta.json -> cache-first, precached per build id
+//   data/tables/*.bin[.gz]          -> cache-first, revalidated once a week
+//   sw.js, transport.opendata.ch    -> not intercepted
 
-export {};
+import { strategyFor } from "./sw-route";
 
-declare const __BUILD_ID__: string;
+declare const __APP_BUILD_ID__: string;
+declare const __DATA_BUILD_ID__: string;
 
-const CACHE = `xsbt-${__BUILD_ID__}`;
+const BUILD_ID = `${__APP_BUILD_ID__}-${__DATA_BUILD_ID__}`;
+const CACHE = `xsbt-${BUILD_ID}`;
+// Per-home tables are large and versioned by their own weekly revalidation, so
+// they live outside the per-build cache and survive a deploy.
+const TABLE_CACHE = "xsbt-tables";
 const TABLE_MAX_AGE_MS = 7 * 24 * 3600_000;
 const CACHED_AT = "x-xsbt-cached-at";
 
 /* Minimal service-worker typings. The project's tsconfig loads lib.dom, and
    pulling in lib.webworker alongside it collides, so declare just what is used. */
+interface SwClient {
+  postMessage(message: unknown): void;
+}
 interface SwExtendableEvent {
   waitUntil(p: Promise<unknown>): void;
 }
@@ -29,7 +41,10 @@ interface SwGlobal {
   addEventListener(type: "fetch", cb: (e: SwFetchEvent) => void): void;
   addEventListener(type: "message", cb: (e: { data: unknown }) => void): void;
   skipWaiting(): Promise<void>;
-  clients: { claim(): Promise<void> };
+  clients: {
+    claim(): Promise<void>;
+    matchAll(options?: { type?: string; includeUncontrolled?: boolean }): Promise<SwClient[]>;
+  };
   registration: { scope: string };
   location: { origin: string };
 }
@@ -66,9 +81,15 @@ sw.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
       for (const name of await caches.keys()) {
-        if (name.startsWith("xsbt-") && name !== CACHE) await caches.delete(name);
+        if (name.startsWith("xsbt-") && name !== CACHE && name !== TABLE_CACHE) {
+          await caches.delete(name);
+        }
       }
       await sw.clients.claim();
+      // XCTrack keeps the widget open for hours, so nothing would otherwise make
+      // the running page pick up the new shell. main.ts reloads once on this.
+      const clients = await sw.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const client of clients) client.postMessage({ type: "xsbt-updated", buildId: BUILD_ID });
     })(),
   );
 });
@@ -82,40 +103,50 @@ sw.addEventListener("fetch", (event) => {
   } catch {
     return;
   }
-  // transport.opendata.ch and anything else cross-origin: network only.
-  if (url.origin !== sw.location.origin) return;
-  // Tables ship gzipped; .bin is the fallback build_tables.py --also-plain emits.
-  if (
-    url.pathname.includes("/data/tables/") &&
-    (url.pathname.endsWith(".bin") || url.pathname.endsWith(".bin.gz"))
-  ) {
-    event.respondWith(tableFirst(req));
-    return;
+  switch (strategyFor(url, req.mode, sw.location.origin)) {
+    case "passthrough":
+      return;
+    case "network-first":
+      event.respondWith(networkFirst(req));
+      return;
+    case "table":
+      event.respondWith(tableFirst(req));
+      return;
+    case "cache-first":
+      event.respondWith(cacheFirst(req));
+      return;
   }
-  event.respondWith(cacheFirst(req));
 });
 
-/** Cache-first with a background fill; navigations fall back to the cached shell. */
-async function cacheFirst(req: Request): Promise<Response> {
+/** Documents: always try the network, so a deploy is picked up on the next load. */
+async function networkFirst(req: Request): Promise<Response> {
   const cache = await caches.open(CACHE);
-  const hit = await cache.match(req, { ignoreSearch: req.mode === "navigate" });
-  if (hit) return hit;
   try {
     const res = await fetch(req);
     if (res.ok && res.type === "basic") await cache.put(req, res.clone());
     return res;
   } catch (err) {
-    if (req.mode === "navigate") {
-      const shell = await cache.match(scoped("index.html"));
-      if (shell) return shell;
-    }
+    const hit = await cache.match(req, { ignoreSearch: true });
+    if (hit) return hit;
+    const shell = await cache.match(scoped("index.html"));
+    if (shell) return shell;
     throw err;
   }
 }
 
+/** Cache-first with a background fill; navigations fall back to the cached shell. */
+async function cacheFirst(req: Request): Promise<Response> {
+  const cache = await caches.open(CACHE);
+  const hit = await cache.match(req);
+  if (hit) return hit;
+  const res = await fetch(req);
+  if (res.ok && res.type === "basic") await cache.put(req, res.clone());
+  return res;
+}
+
 /** Per-home table: serve from cache, refetch in the background once a week. */
 async function tableFirst(req: Request): Promise<Response> {
-  const cache = await caches.open(CACHE);
+  const cache = await caches.open(TABLE_CACHE);
   const hit = await cache.match(req);
   if (hit) {
     const at = Number(hit.headers.get(CACHED_AT) ?? 0);
