@@ -44,8 +44,13 @@
       </div>
       <div class="field">
         <label for="cfg-lsafe">Safe glide ratio</label>
-        <span class="help">Threshold for the SAFEST pick and the red/amber/green coloring.</span>
+        <span class="help">L at or below this shows green; SAFEST is judged against it.</span>
         <input id="cfg-lsafe" type="number" min="1" step="0.5" />
+      </div>
+      <div class="field">
+        <label for="cfg-lamber">Amber glide ratio</label>
+        <span class="help">L above lsafe and up to lamber shows amber; above is red.</span>
+        <input id="cfg-lamber" type="number" min="1" step="0.5" />
       </div>
       <div class="field">
         <label for="cfg-margin">Safety margin (m)</label>

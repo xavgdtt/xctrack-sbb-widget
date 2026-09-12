@@ -17,6 +17,7 @@ interface Defaults {
   margin: number;
   lmax: number;
   lsafe: number;
+  lamber: number;
   mode: ThemeMode;
   refresh: number;
   maxRoute: number;
@@ -31,6 +32,7 @@ const DEFAULTS: Defaults = {
   margin: 150,
   lmax: 15,
   lsafe: 6,
+  lamber: 9,
   mode: "dark",
   refresh: 120,
   maxRoute: 8,
@@ -58,6 +60,7 @@ const inputs = {
   margin: el<HTMLInputElement>("cfg-margin"),
   lmax: el<HTMLInputElement>("cfg-lmax"),
   lsafe: el<HTMLInputElement>("cfg-lsafe"),
+  lamber: el<HTMLInputElement>("cfg-lamber"),
   mode: el<HTMLSelectElement>("cfg-mode"),
   refresh: el<HTMLInputElement>("cfg-refresh"),
   maxRoute: el<HTMLInputElement>("cfg-maxRoute"),
@@ -229,6 +232,7 @@ function initDefaults(): void {
   inputs.margin.value = String(DEFAULTS.margin);
   inputs.lmax.value = String(DEFAULTS.lmax);
   inputs.lsafe.value = String(DEFAULTS.lsafe);
+  inputs.lamber.value = String(DEFAULTS.lamber);
   inputs.mode.value = DEFAULTS.mode;
   inputs.refresh.value = String(DEFAULTS.refresh);
   inputs.maxRoute.value = String(DEFAULTS.maxRoute);
@@ -278,6 +282,8 @@ function buildWidgetUrl(): URL | null {
   if (Number.isFinite(lmax) && lmax !== DEFAULTS.lmax) params.set("lmax", String(lmax));
   const lsafe = Number(inputs.lsafe.value);
   if (Number.isFinite(lsafe) && lsafe !== DEFAULTS.lsafe) params.set("lsafe", String(lsafe));
+  const lamber = Number(inputs.lamber.value);
+  if (Number.isFinite(lamber) && lamber !== DEFAULTS.lamber) params.set("lamber", String(lamber));
   if (inputs.mode.value !== DEFAULTS.mode) params.set("mode", inputs.mode.value);
   const refresh = Number(inputs.refresh.value);
   if (Number.isFinite(refresh) && refresh !== DEFAULTS.refresh) params.set("refresh", String(refresh));

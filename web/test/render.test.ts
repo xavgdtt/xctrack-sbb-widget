@@ -22,7 +22,7 @@ function cell(over: Partial<Cell> = {}): Cell {
   };
 }
 
-const CELLS = [cell({ role: "SAFEST", name: "Wilderswil" }), cell(), cell({ role: "NEAREST" })];
+const CELLS = [cell({ role: "SAFEST", name: "Wilderswil" }), cell(), cell({ role: "ALT" })];
 
 /** Minimal stand-in for an SVGSVGElement: render() only sets attributes and innerHTML. */
 function fakeSvg(): { innerHTML: string; attrs: Record<string, string> } & SVGSVGElement {
@@ -60,7 +60,7 @@ function pick(role: Role, over: Partial<Pick> = {}): Pick {
 
 function model(over: Partial<RenderModel> = {}): RenderModel {
   return {
-    picks: [pick("safest"), pick("best"), pick("nearest")],
+    picks: [pick("safest"), pick("best"), pick("alt")],
     mode: "earliest",
     homeByLabel: null,
     track: null,

@@ -70,25 +70,34 @@ walk, and rounds up to the next minute to get the earliest usable departure.
 **Ranking.** For every reachable stop it estimates the arrival time at home:
 `arrivalEst = earliestDep + travelEst`, where `travelEst` comes from the phase 2 offline
 travel-time table when one is loaded, and otherwise from a heuristic (straight-line
-distance at 50 km/h plus a wait allowance and a mode penalty). It then builds the Pareto
-front over "lower required glide ratio" and "earlier arrival at home", and picks three:
+distance at 50 km/h plus a wait allowance and a mode penalty). Once a stop has been
+routed live, its journey's arrival replaces that estimate. Three roles are then filled:
 
-1. **Safest** — among stops needing `Lreq <= lsafe`, the one arriving home earliest; if
-   none qualify, simply the stop with the lowest `Lreq`.
-2. **Best** — the earliest arrival on the front.
-3. **Nearest** — the front's knee point: the one buying the most arrival-time improvement
-   per unit of extra glide ratio over **Safest**, excluding the other two picks.
+1. **BEST** — the reachable stop arriving home earliest. Ties go to the lower required
+   glide ratio `Lreq`.
+2. **SAFEST** — the reachable stop with the lowest `Lreq`. Ties go to the earlier arrival.
+3. **ALT** — the stop with the next-earliest arrival whose bearing from the pilot differs
+   from BEST's by at least 60 degrees, so it is a genuinely different decision rather than
+   a second field in the same valley. Ties go to the lower `Lreq`.
 
-Picks that point in nearly the same direction and sit close together are rejected in
-favour of the next point on the front, so the three options are genuinely different
-choices. The picks plus a few near-front candidates are then routed live against
-transport.opendata.ch; if live departures change the ordering, the pick-3 is rerun on the
-routed data.
+The three are then pruned, so the widget shows one to three cells rather than repeating a
+stop: SAFEST is dropped when it is the same stop as BEST, or when its `Lreq` is not
+strictly lower than BEST's (it would add nothing); ALT is dropped when no stop is far
+enough off BEST's bearing, or when it would repeat SAFEST. Cells are always drawn in the
+order SAFEST, BEST, ALT. A stop the live API reports no connections for ("no service")
+cannot hold any role. The picks plus a few near-front candidates are routed live against
+transport.opendata.ch, and the roles are refilled on the routed data.
+
+**Colour code.** Each cell is tinted by its required glide ratio: green for `Lreq <= lsafe`
+(default 6), amber above that and up to `lamber` (default 9), red above `lamber`. Both
+thresholds are URL parameters and fields on the setup page.
 
 **Home-by mode.** Instead of "earliest", the pilot sets a land-by-home deadline. Each
-candidate gets a time budget: minutes left before its latest connection that still makes
-the deadline. Stops with a negative budget (already too late) drop out; BEST becomes the
-stop with the most flying time left rather than the earliest arrival. The budget line
+candidate gets a land-by deadline and a time budget: minutes left before its latest
+connection that still makes the deadline. Stops with a negative budget (already too late)
+drop out; BEST becomes the stop with the latest deadline — the most flying time left —
+rather than the earliest arrival, and ALT the next-latest deadline at least 60 degrees off
+it. SAFEST is still the lowest `Lreq`, pruned by the same rule. The budget line
 turns red under 15 minutes. If no stop can make the deadline, ranking falls back to
 earliest mode silently and the widget shows that fallback happened.
 

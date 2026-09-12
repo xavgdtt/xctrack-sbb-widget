@@ -20,7 +20,7 @@ export interface Stop {
   e: number;
   m: number;
 }
-export type Role = "safest" | "best" | "nearest";
+export type Role = "safest" | "best" | "alt";
 export type Mode = "earliest" | "homeBy";
 export interface Candidate {
   stop: Stop;
@@ -56,6 +56,8 @@ export interface Config {
   margin: number;
   lmax: number;
   lsafe: number;
+  /** Glide ratio up to which a stop is drawn amber; above it, red. */
+  lamber: number;
   mode: "dark" | "light";
   refresh: number;
   maxRoute: number;

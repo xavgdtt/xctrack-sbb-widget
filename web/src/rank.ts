@@ -1,21 +1,20 @@
-// Picking the three stops the widget shows: SAFEST, BEST, NEAREST, with a
-// diversity rule so the pilot is not offered the same field three times.
+// Picking the stops the widget shows: SAFEST, BEST, ALT. BEST is the stop that
+// gets the pilot home earliest (or, in home-by mode, buys the most flying time),
+// SAFEST the one needing the gentlest glide, ALT a genuinely different direction.
 // In home-by mode the ranking works backwards from a target arrival time.
 
 import type { Candidate, Journey, Mode, Pick, Role } from "./types";
 import { angleDiffDeg } from "./geo";
 
-/** Bearing spread below which two candidates count as the same direction. */
-export const DIVERSITY_ANGLE_DEG = 45;
-/** Distance below which two candidates in the same direction count as the same spot. */
-export const DIVERSITY_DIST_M = 3000;
+/** Minimum bearing spread between BEST and ALT, in degrees. */
+export const ALT_MIN_BEARING_DIFF_DEG = 60;
 /** A home-by budget below this many minutes is shown as critical. */
 export const BUDGET_CRITICAL_MIN = 15;
 
 export interface RankInput {
   candidates: readonly Candidate[];
   mode: Mode;
-  /** Safe glide-ratio threshold (`lsafe`). */
+  /** Safe glide-ratio threshold (`lsafe`). Kept for callers; roles rank on `lreq` directly. */
   lsafe: number;
   /** Packing + walking minutes, subtracted from the latest departure in home-by mode. */
   groundMin: number;
@@ -23,6 +22,8 @@ export interface RankInput {
   homeByMs?: number | null;
   /** Live journeys per stop id, when routing has run. */
   journeys?: ReadonlyMap<number, Journey> | null;
+  /** Stop ids the live API reported no service for; they cannot hold a role. */
+  noService?: ReadonlySet<number> | null;
   /** Evaluation time, epoch ms. */
   now?: number;
 }
@@ -36,127 +37,93 @@ export interface RankResult {
 }
 
 /**
- * Rank candidates and return up to three picks.
+ * Rank candidates and return one to three picks, ordered SAFEST, BEST, ALT.
  *
- * Earliest mode: SAFEST is the earliest arrival among stops within `lsafe` (or the
- * lowest required glide overall if none qualifies), BEST the earliest arrival of
- * what is left, NEAREST the closest of what is left.
+ * BEST is the reachable stop arriving home earliest — from the live journey when
+ * one has been fetched for it, otherwise from the estimate. SAFEST is the stop
+ * with the lowest required glide ratio, and is dropped unless that ratio is
+ * strictly lower than BEST's. ALT is the next-earliest arrival lying at least
+ * 60 degrees away from BEST's bearing, and is dropped when it repeats SAFEST.
  *
- * Home-by mode: each stop gets a land-by deadline and a time budget from the latest
- * connection arriving by the target; stops with a negative budget drop out and BEST
- * becomes the stop with the most flying time left. If no stop can make the target
- * the ranking silently falls back to earliest mode and reports `missedHomeBy`.
+ * Home-by mode ranks on the land-by deadline instead of the arrival: BEST is the
+ * latest deadline (the most flying time left) among stops that can still make the
+ * target. If no stop can, the ranking silently falls back to earliest mode and
+ * reports `missedHomeBy`.
  */
 export function rank(input: RankInput): RankResult {
   const now = input.now ?? Date.now();
+  const eligible = input.candidates.filter((c) => !input.noService?.has(c.stop.id));
+
   if (input.mode === "homeBy" && input.homeByMs != null) {
-    const feasible = input.candidates.filter(
-      (c) => budgetOf(c, input, now) !== null && budgetOf(c, input, now)! >= 0,
-    );
+    const feasible = eligible.filter((c) => {
+      const budget = budgetOf(c, input, now);
+      return budget !== null && budget >= 0;
+    });
     if (feasible.length > 0) {
-      return { picks: pickHomeBy(feasible, input, now), mode: "homeBy", missedHomeBy: false };
+      const order = (c: Candidate) => -(landByOf(c, input) ?? Number.NEGATIVE_INFINITY);
+      return {
+        picks: pick(feasible, order, input, now),
+        mode: "homeBy",
+        missedHomeBy: false,
+      };
     }
     return {
-      picks: pickEarliest(input.candidates, input),
+      picks: pick(eligible, arrivalKeyOf(input), input, null),
       mode: "earliest",
       missedHomeBy: true,
     };
   }
-  return { picks: pickEarliest(input.candidates, input), mode: "earliest", missedHomeBy: false };
-}
-
-function pickEarliest(candidates: readonly Candidate[], input: RankInput): Pick[] {
-  if (candidates.length === 0) return [];
-  const remaining = [...candidates];
-  const picks: Pick[] = [];
-
-  const safe = remaining.filter((c) => c.lreq <= input.lsafe);
-  const safest =
-    safe.length > 0
-      ? minBy(safe, arrivalKey)
-      : minBy(remaining, (c) => c.lreq);
-  take(picks, remaining, safest, "safest", input, null);
-
-  const best = choose(remaining, picks, arrivalKey);
-  take(picks, remaining, best, "best", input, null);
-
-  const nearest = choose(remaining, picks, (c) => c.distM);
-  take(picks, remaining, nearest, "nearest", input, null);
-
-  return picks;
-}
-
-function pickHomeBy(candidates: readonly Candidate[], input: RankInput, now: number): Pick[] {
-  const remaining = [...candidates];
-  const picks: Pick[] = [];
-  const budgets = new Map<Candidate, number>();
-  for (const c of remaining) budgets.set(c, budgetOf(c, input, now) ?? 0);
-
-  const safe = remaining.filter((c) => c.lreq <= input.lsafe);
-  const safest =
-    safe.length > 0 ? minBy(safe, arrivalKey) : minBy(remaining, (c) => c.lreq);
-  take(picks, remaining, safest, "safest", input, now);
-
-  // Best in home-by mode is the latest deadline, i.e. the most flying time left.
-  const best = choose(remaining, picks, (c) => -(budgets.get(c) ?? 0));
-  take(picks, remaining, best, "best", input, now);
-
-  const nearest = choose(remaining, picks, (c) => c.distM);
-  take(picks, remaining, nearest, "nearest", input, now);
-
-  return picks;
+  return {
+    picks: pick(eligible, arrivalKeyOf(input), input, null),
+    mode: "earliest",
+    missedHomeBy: false,
+  };
 }
 
 /**
- * Lowest-scoring candidate that is not already picked and is not a near-duplicate
- * of one (same direction within 45 degrees and within 3 km).
+ * The three roles over one candidate set. `order` scores the mode's notion of a
+ * good stop (lower is better): earliest arrival home, or latest land-by deadline.
+ * `now` is null in earliest mode, where picks carry no deadline or budget.
  */
-function choose(
-  remaining: readonly Candidate[],
-  picks: readonly Pick[],
-  score: (c: Candidate) => number,
-): Candidate | null {
-  const ordered = [...remaining].sort((a, b) => score(a) - score(b));
-  for (const cand of ordered) {
-    if (!picks.some((p) => isDuplicate(cand, p.cand))) return cand;
-  }
-  return null;
-}
-
-/** Two candidates are duplicates when they lie in the same direction and close together. */
-export function isDuplicate(a: Candidate, b: Candidate): boolean {
-  if (angleDiffDeg(a.bearing, b.bearing) > DIVERSITY_ANGLE_DEG) return false;
-  return distanceBetween(a, b) < DIVERSITY_DIST_M;
-}
-
-/** Planar distance between two candidate stops, in metres (they are always close). */
-function distanceBetween(a: Candidate, b: Candidate): number {
-  const dLat = (a.stop.lat - b.stop.lat) * 111_320;
-  const dLon =
-    (a.stop.lon - b.stop.lon) * 111_320 * Math.cos(((a.stop.lat + b.stop.lat) / 2) * (Math.PI / 180));
-  return Math.hypot(dLat, dLon);
-}
-
-function take(
-  picks: Pick[],
-  remaining: Candidate[],
-  cand: Candidate | null,
-  role: Role,
+function pick(
+  candidates: readonly Candidate[],
+  order: (c: Candidate) => number,
   input: RankInput,
   now: number | null,
-): void {
-  if (!cand) return;
-  const idx = remaining.indexOf(cand);
-  if (idx >= 0) remaining.splice(idx, 1);
-  const journey = input.journeys?.get(cand.stop.id) ?? null;
-  const landBy = now === null ? null : landByOf(cand, input);
-  picks.push({
+): Pick[] {
+  if (candidates.length === 0) return [];
+
+  // Lower score first, then the gentler glide.
+  const byOrder = [...candidates].sort((a, b) => order(a) - order(b) || a.lreq - b.lreq);
+  const best = byOrder[0]!;
+
+  // Gentlest glide first, then the mode's own ordering.
+  const safest = [...candidates].sort((a, b) => a.lreq - b.lreq || order(a) - order(b))[0]!;
+  const keepSafest = safest.stop.id !== best.stop.id && safest.lreq < best.lreq;
+
+  const alt =
+    byOrder.find(
+      (c) =>
+        c.stop.id !== best.stop.id &&
+        angleDiffDeg(c.bearing, best.bearing) >= ALT_MIN_BEARING_DIFF_DEG,
+    ) ?? null;
+  const keepAlt = alt !== null && !(keepSafest && alt.stop.id === safest.stop.id);
+
+  const picks: Pick[] = [];
+  if (keepSafest) picks.push(toPick(safest, "safest", input, now));
+  picks.push(toPick(best, "best", input, now));
+  if (keepAlt) picks.push(toPick(alt, "alt", input, now));
+  return picks;
+}
+
+function toPick(cand: Candidate, role: Role, input: RankInput, now: number | null): Pick {
+  return {
     role,
     cand,
-    journey,
-    landBy,
+    journey: input.journeys?.get(cand.stop.id) ?? null,
+    landBy: now === null ? null : landByOf(cand, input),
     budgetMin: now === null ? null : budgetOf(cand, input, now),
-  });
+  };
 }
 
 /**
@@ -188,20 +155,8 @@ function latestDepartureOf(cand: Candidate, input: RankInput): number | null {
   return input.homeByMs - cand.travelEstMin * 60_000;
 }
 
-function arrivalKey(c: Candidate): number {
-  return c.arrivalEst ?? Number.POSITIVE_INFINITY;
+/** Arrival home: the live journey's when one has been fetched, else the estimate. */
+function arrivalKeyOf(input: RankInput): (c: Candidate) => number {
+  return (c) =>
+    input.journeys?.get(c.stop.id)?.arr ?? c.arrivalEst ?? Number.POSITIVE_INFINITY;
 }
-
-function minBy<T>(items: readonly T[], score: (item: T) => number): T | null {
-  let best: T | null = null;
-  let bestScore = Number.POSITIVE_INFINITY;
-  for (const item of items) {
-    const s = score(item);
-    if (s < bestScore) {
-      bestScore = s;
-      best = item;
-    }
-  }
-  return best;
-}
-

@@ -92,6 +92,8 @@ function start(): Loop {
   let source: LocationSourceName = "none";
   let candidates: Candidate[] = [];
   let journeys: Map<number, Journey> = new Map();
+  /** Stop ids the live API reported no connections for; they cannot hold a role. */
+  let noService: Set<number> = new Set();
   let model: RenderModel = idleModel(cfg0, "loading stops…");
 
   /** Fix and time of the last completed routing cycle. */
@@ -104,7 +106,7 @@ function start(): Loop {
 
   function draw(): void {
     const cfg = getConfig();
-    render(svg, model, w, h, { lsafe: cfg.lsafe });
+    render(svg, model, w, h, { lsafe: cfg.lsafe, lamber: cfg.lamber });
   }
 
   /** Cheap path: rebuild candidates and picks from the current fix, then draw. */
@@ -140,6 +142,7 @@ function start(): Loop {
       groundMin: cfg.pack + cfg.walk,
       homeByMs,
       journeys,
+      noService,
       now,
     });
     const offline = isOffline(client, journeys);
@@ -177,11 +180,18 @@ function start(): Loop {
       );
       const outcomes = await client.route(requests, { arrival });
       const next = new Map(client.allLastGood());
+      const dead = new Set(noService);
       for (const [stopId, outcome] of outcomes) {
-        if (outcome.journey) next.set(stopId, outcome.journey);
-        else if (outcome.noService) next.delete(stopId);
+        if (outcome.journey) {
+          next.set(stopId, outcome.journey);
+          dead.delete(stopId);
+        } else if (outcome.noService) {
+          next.delete(stopId);
+          dead.add(stopId);
+        }
       }
       journeys = next;
+      noService = dead;
       cycleFix = at;
       cycleAt = clock.nowMs();
       cycleAtWall = Date.now();
