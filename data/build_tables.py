@@ -320,7 +320,9 @@ def _read_rows(zf: zipfile.ZipFile, name: str):
 @contextlib.contextmanager
 def _member_writer(zf: zipfile.ZipFile, name: str, fieldnames: list[str]):
     """Write one member row by row, without buffering the whole table."""
-    with zf.open(name, "w") as raw:
+    # force_zip64: stop_times.txt uncompressed is > 4 GB for the full Swiss
+    # feed, which overflows the classic zip member size field without it.
+    with zf.open(name, "w", force_zip64=True) as raw:
         text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
         writer = csv.DictWriter(text, fieldnames=fieldnames, restval="", extrasaction="ignore")
         writer.writeheader()
@@ -425,7 +427,11 @@ def sanitise_gtfs(src_zip: Path, out_dir: Path) -> Path:
         names = [n for n in src.namelist() if not n.endswith("/")]
         # compresslevel=1: this zip is a local cache read once by R5, and
         # stop_times.txt is big enough that deflate time dominates the step.
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as out:
+        # allowZip64=True (the default, made explicit): required for members
+        # and an archive that exceed the classic 4 GB zip limit.
+        with zipfile.ZipFile(
+            tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True
+        ) as out:
             dropped_routes = _sanitise_routes(src, out)
 
             dropped_trips: set[str] = set()
@@ -489,7 +495,9 @@ def sanitise_gtfs(src_zip: Path, out_dir: Path) -> Path:
                 if name in rewritten:
                     continue
                 # Streamed: shapes.txt alone can be hundreds of megabytes.
-                with src.open(name) as raw, out.open(name, "w") as copy:
+                # force_zip64: some members (e.g. stop_times.txt) exceed 4 GB
+                # uncompressed, which overflows the classic zip size field.
+                with src.open(name) as raw, out.open(name, "w", force_zip64=True) as copy:
                     shutil.copyfileobj(raw, copy, length=1 << 20)
 
     tmp.replace(dest)

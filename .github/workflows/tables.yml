@@ -90,6 +90,19 @@ jobs:
           key: tables-ckpt-${{ steps.stamp.outputs.stops }}-${{ github.run_id }}
           restore-keys: tables-ckpt-${{ steps.stamp.outputs.stops }}-
 
+      # r5py pickles the built transport network (and caches the ~64 MB R5
+      # jar it downloads) under ~/.cache/r5py. build_tables.py downloads the
+      # GTFS zip and OSM PBF itself, so their hashes aren't known before this
+      # step runs; key on the month plus homes.txt instead, with a
+      # restore-keys prefix so a stale network is still reused rather than
+      # rebuilt from scratch.
+      - name: Cache r5py network
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/r5py
+          key: r5py-network-${{ steps.stamp.outputs.month }}-${{ hashFiles('data/homes.txt') }}
+          restore-keys: r5py-network-
+
       - name: Build tables
         working-directory: data
         run: |
