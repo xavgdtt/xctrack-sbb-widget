@@ -67,11 +67,16 @@ jobs:
           echo "stops=$(sha256sum web/public/data/stops.json.gz | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       # GTFS zip (~250 MB), Geofabrik PBF (~400 MB), the cropped PBF and the R5
-      # network R5 writes next to it. Refreshed monthly by the key.
+      # network R5 writes next to it, plus the sanitised GTFS copy R5 actually
+      # routes on (data/cache/gtfs, named after the hash of the original zip, so
+      # a restored entry for a different feed is simply ignored and rebuilt).
+      # Refreshed monthly by the key.
       - name: Cache GTFS / OSM / R5 network
         uses: actions/cache@v4
         with:
-          path: data/downloads
+          path: |
+            data/downloads
+            data/cache/gtfs
           key: tables-inputs-${{ steps.stamp.outputs.month }}
           restore-keys: tables-inputs-
 

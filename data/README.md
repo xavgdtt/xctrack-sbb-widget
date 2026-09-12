@@ -233,6 +233,90 @@ The OSM extract is cropped to the Swiss bounding box with
 installed (`apt install osmium-tool`); without it the uncropped file works but
 costs more memory.
 
+## Sanitising the GTFS for R5
+
+R5 cannot route on `gtfs_fp2026` as published. The feed uses the extended
+(TPEG) `route_type` codes, and `TransitLayer.getTransitModes` (R5 7.5.1, the
+build r5py 1.1.x downloads) throws on two ranges:
+
+```
+java.lang.IllegalArgumentException: Taxi route_type code not supported: 1500
+```
+
+It throws from `FilteredPatterns`, during routing — the download, the OSM crop
+and the network build all succeed first, so the failure arrives half an hour
+into a run.
+
+`build_tables.py` therefore writes an R5-safe copy of the feed to
+`cache/gtfs/gtfs-r5-v<n>-<sourceHash>.zip` before building the network, and
+hands R5 that. `<sourceHash>` is the hash of the **original** zip, so the copy
+is rebuilt only when the feed changes; `<n>` is `SANITISER_VERSION`, bumped
+whenever the rules below change so an older copy is never reused. Everything
+else still keys off the original file: the validity window is read from it, and
+the checkpoint directory is still `h2s-<buildId>-<gtfsHash>` with the hash of
+the original. It costs about a minute (a streaming rewrite of the ~1 GB
+`stop_times.txt`) and a few hundred MB on disk.
+
+`routes.txt` — every `route_type` is folded onto the basic GTFS set, the way
+R5's own `getTransitModes` would have classified it. The ranges are whole
+hundreds, not just the sub-codes the Swiss feed documents, so an unseen code
+still lands somewhere sensible:
+
+| source `route_type` | | becomes | |
+|---|---|---|---|
+| 0–7, 11, 12 | basic codes | unchanged | (8–10 are unassigned → dropped) |
+| 100–199 | railway | `2` | rail |
+| 200–299 | coach | `3` | bus |
+| 300–399 | suburban railway | `2` | rail |
+| 400–499 | urban railway | `2` | rail, except 401/402 → `1` subway and 405 → `12` monorail |
+| 500–699 | metro, underground | `1` | subway |
+| 700–799 | bus | `3` | bus |
+| 800–899 | trolleybus | `11` | trolleybus |
+| 900–999 | tram | `0` | tram |
+| 1000–1099 | water transport | `4` | ferry |
+| 1200–1299 | ferry | `4` | ferry |
+| 1300–1399 | telecabin, aerial lift | `6` | gondola |
+| 1400–1499 | funicular | `7` | funicular |
+| 1100–1199 | air | **dropped** | no basic equivalent |
+| 1500–1599 | taxi, on-demand | **dropped** | the code that crashes R5 |
+| 1600+ | car, misc (1700) | **dropped** | R5 rejects everything ≥ 1600 |
+
+Remapping does not change any travel time: the tables are built with
+`TransportMode.TRANSIT`, R5's "any transit mode", so `route_type` only decides
+which mode label a pattern carries. Losing the dropped routes does: 1500 is
+Swiss on-demand and dial-a-bus service, 1700 the miscellaneous bucket. Neither
+is something a pilot should be told to rely on for a retrieve, and R5 refuses to
+route on them anyway.
+
+A dropped route takes its trips, their `stop_times` rows and any `frequencies`
+rows with it. It has to: `TransitLayer.loadFromGtfs` looks up
+`gtfs.routes.get(trip.route_id)` per trip and dereferences it without a null
+check, so an orphaned trip is a `NullPointerException`.
+
+Two further things the same pass fixes, found by reading the R5 loaders rather
+than by hitting them:
+
+- **`agency_id`** — `RouteInfo` does `agency.agency_name` with no null check, so
+  a route whose `agency_id` is blank or dangling crashes the network build once
+  the feed has more than one agency (with exactly one, `Route.Loader`
+  associates it automatically). Such routes are pointed at the first agency in
+  `agency.txt`, with a warning.
+- **`stops.txt` `location_type` 2, 3 and 4** (entrance, generic node, boarding
+  area) — R5 loads them as ordinary stops, and the spec lets them omit
+  coordinates, which would put them at latitude NaN. They are dropped, together
+  with any `transfers.txt` row referencing them. A row that `stop_times.txt`
+  actually references is kept regardless: R5 resolves stop ids through a map
+  that returns index 0 on a miss, so a dangling reference would silently attach
+  trips to the wrong stop.
+
+Checked and deliberately left alone: `transfers.txt` with `transfer_type` 4 or
+5 (`GtfsTransferLoader` counts and skips in-seat transfers, it does not fail);
+`frequencies.txt` and `feed_info.txt` (both optional for R5); out-of-range
+values generally — `Entity.getIntField` records a `RangeError` on the feed and
+keeps the value, it does not abort. Everything not listed above — calendar,
+calendar_dates, agency, feed_info, shapes, pathways, levels — is copied
+through byte for byte.
+
 ## Memory and runtime
 
 R5 is a JVM program. `JAVA_TOOL_OPTIONS=-Xmx6g` is the setting that matters;
@@ -253,8 +337,9 @@ because R5 propagates to all of them inside the same search. `--home-batch`
 | 1 day type, 16 hours | 16 | 1,600 | ~15 minutes |
 | full 3 × 16 grid, 100 homes | 48 | 4,800 | under an hour |
 
-Add roughly 10–15 minutes for the downloads, the `osmium` crop and the R5
-network build, which now cost more than the routing does. The whole grid fits
+Add roughly 10–15 minutes for the downloads, the `osmium` crop, the GTFS
+sanitising pass and the R5 network build, which now cost more than the routing
+does. The whole grid fits
 one CI run; the tiering ladder the stop → home direction needed is gone.
 
 The run is still resumable, which matters for a cold cache and for a runner that
@@ -358,8 +443,8 @@ against (Zürich HB, Bern, Interlaken Ost, Lausanne, Luzern, Chur, Sion).
 
 `.github/workflows/tables.yml`: monthly cron plus `workflow_dispatch` with
 `homes_limit` / `day_types` / `hours` / `time_budget_min` inputs. It installs
-Java 21, uv and `osmium-tool`, caches `data/downloads` per month and
-`data/cache/tables` per stops hash (so an out-of-budget run resumes next time),
+Java 21, uv and `osmium-tool`, caches `data/downloads` and `data/cache/gtfs`
+(the sanitised feed) per month and `data/cache/tables` per stops hash (so an out-of-budget run resumes next time),
 runs the build with `JAVA_TOOL_OPTIONS=-Xmx6g`, and uploads
 `web/public/data/tables/` (the `.bin.gz` files) as the `tables` artifact. It
 does not pass `--also-plain`.

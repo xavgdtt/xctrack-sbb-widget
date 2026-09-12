@@ -7,7 +7,8 @@ travel time, including the initial wait, between the home and *every* stop in
 table cached the widget can rank stops with no network at all.
 
 Pipeline: Swiss GTFS (opentransportdata.swiss permalink) + a Switzerland OSM
-extract (Geofabrik, cropped with ``osmium`` when available) -> an R5 transport
+extract (Geofabrik, cropped with ``osmium`` when available) -> a sanitised copy
+of the GTFS that R5 can route on (:func:`sanitise_gtfs`) -> an R5 transport
 network via r5py -> one ``r5py.TravelTimeMatrix`` per (day type, hour, batch of
 homes), origins = the homes, destinations = all stops.
 
@@ -48,8 +49,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import csv
 import datetime as dt
 import gzip
+import io
 import json
 import logging
 import os
@@ -69,6 +73,7 @@ from build_homes import CH_BBOX, read_homes
 DATA_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = DATA_DIR / "downloads"
 CACHE_DIR = DATA_DIR / "cache" / "tables"
+GTFS_CACHE_DIR = DATA_DIR / "cache" / "gtfs"
 HOMES_PATH = DATA_DIR / "homes.txt"
 WEB_DATA_DIR = DATA_DIR.parent / "web" / "public" / "data"
 STOPS_PATH = WEB_DATA_DIR / "stops.json.gz"
@@ -238,6 +243,266 @@ def load_build_id() -> str:
 
 
 # --------------------------------------------------------------------------
+# GTFS sanitising
+# --------------------------------------------------------------------------
+
+# Bump when the rules below change, so a cached sanitised zip built by an older
+# version of this file is not reused.
+SANITISER_VERSION = 1
+
+
+def basic_route_type(code: int) -> int | None:
+    """Map a GTFS ``route_type`` to the basic set, or ``None`` to drop the route.
+
+    The Swiss feed uses the extended (TPEG) codes — 1xx rail, 2xx coach, 4xx
+    urban rail, 7xx bus, 9xx tram, 10xx water, 13xx aerial, 14xx funicular,
+    15xx taxi/on-demand, 1700 misc. R5 7.5.1 accepts most of those, but
+    ``TransitLayer.getTransitModes`` throws ``IllegalArgumentException`` for
+    1500-1599 ("Taxi route_type code not supported") and for anything >= 1600
+    ("Car or other route_type code above 1600 not supported") — and it throws
+    from ``FilteredPatterns``, i.e. during routing, long after the network has
+    been built and cached. Anything it does not recognise at all ("Unknown GTFS
+    route_type code") throws from the same place.
+
+    Rather than remap only the codes that throw, every extended code is folded
+    onto the basic one R5's own ``getTransitModes`` would have produced. The
+    ranges are whole hundreds, not just the sub-codes the Swiss feed documents,
+    so a code nobody has seen yet still lands somewhere sensible. Mapping does
+    not change routing: the tables are built with ``TransportMode.TRANSIT``,
+    which is R5's "any transit mode", so ``route_type`` only ever decides which
+    mode label a pattern carries.
+    """
+    if code in (0, 1, 2, 3, 4, 5, 6, 7, 11, 12):
+        return code  # already a basic code (8, 9, 10 are unassigned)
+    if 100 <= code < 200:  # railway service
+        return 2
+    if 200 <= code < 300:  # coach service
+        return 3
+    if 300 <= code < 400:  # suburban railway service
+        return 2
+    if 400 <= code < 500:  # urban railway service
+        if code in (401, 402):  # metro, underground
+            return 1
+        if code == 405:  # monorail
+            return 12
+        return 2
+    if 500 <= code < 700:  # metro and underground service
+        return 1
+    if 700 <= code < 800:  # bus service
+        return 3
+    if 800 <= code < 900:  # trolleybus service
+        return 11
+    if 900 <= code < 1000:  # tram service
+        return 0
+    if 1000 <= code < 1100:  # water transport service
+        return 4
+    if 1200 <= code < 1300:  # ferry service
+        return 4
+    if 1300 <= code < 1400:  # telecabin / aerial lift service
+        return 6
+    if 1400 <= code < 1500:  # funicular service
+        return 7
+    # 1100-1199 air, 1500-1599 taxi / on-demand, 1600+ car and "misc" (1700),
+    # and anything unrecognised: no basic equivalent, so drop the route.
+    return None
+
+
+def _read_rows(zf: zipfile.ZipFile, name: str):
+    """Stream one member as dicts. ``stop_times.txt`` is ~1 GB uncompressed, so
+    nothing here ever holds more than one row."""
+    with zf.open(name) as raw:
+        text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+        reader = csv.DictReader(text)
+        yield reader.fieldnames or []
+        yield from reader
+
+
+@contextlib.contextmanager
+def _member_writer(zf: zipfile.ZipFile, name: str, fieldnames: list[str]):
+    """Write one member row by row, without buffering the whole table."""
+    with zf.open(name, "w") as raw:
+        text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+        writer = csv.DictWriter(text, fieldnames=fieldnames, restval="", extrasaction="ignore")
+        writer.writeheader()
+        yield writer
+        text.flush()
+        text.detach()
+
+
+def _sanitise_routes(src: zipfile.ZipFile, out: zipfile.ZipFile) -> set[str]:
+    """Rewrite routes.txt with basic route types; return the dropped route ids.
+
+    Also repairs ``agency_id``: ``RouteInfo`` dereferences the agency without a
+    null check, so a route whose ``agency_id`` is blank or dangling is a
+    ``NullPointerException`` during the network build as soon as the feed has
+    more than one agency (with exactly one, R5 associates it automatically).
+    """
+    agency_ids: list[str] = []
+    if "agency.txt" in src.namelist():
+        agency_rows = _read_rows(src, "agency.txt")
+        next(agency_rows)
+        agency_ids = [(row.get("agency_id") or "").strip() for row in agency_rows]
+        agency_ids = [a for a in agency_ids if a]
+
+    rows = _read_rows(src, "routes.txt")
+    fields = list(next(rows))
+    if agency_ids and "agency_id" not in fields:
+        fields.insert(1, "agency_id")
+
+    known_agencies = set(agency_ids)
+    mapped: dict[tuple[int, int | None], int] = {}
+    dropped: set[str] = set()
+    repaired_agency = 0
+    with _member_writer(out, "routes.txt", fields) as writer:
+        for row in rows:
+            raw_type = (row.get("route_type") or "").strip()
+            try:
+                code = int(raw_type)
+            except ValueError:
+                code = -1
+            target = basic_route_type(code)
+            mapped[(code, target)] = mapped.get((code, target), 0) + 1
+            if target is None:
+                dropped.add(row["route_id"])
+                continue
+            row["route_type"] = str(target)
+            if len(known_agencies) > 1 and (row.get("agency_id") or "").strip() not in known_agencies:
+                row["agency_id"] = agency_ids[0]
+                repaired_agency += 1
+            writer.writerow(row)
+
+    for (code, target), count in sorted(mapped.items()):
+        log.info(
+            "  route_type %-5s -> %-6s %6d route%s",
+            code if code >= 0 else "(bad)",
+            "dropped" if target is None else target,
+            count,
+            "" if count == 1 else "s",
+        )
+    if repaired_agency:
+        log.warning("  %d routes had an unresolvable agency_id, pointed at %s",
+                    repaired_agency, agency_ids[0])
+    return dropped
+
+
+def sanitise_gtfs(src_zip: Path, out_dir: Path) -> Path:
+    """Write an R5-safe copy of ``src_zip`` and return its path.
+
+    The copy is named after the hash of the source, so it is rebuilt only when
+    the feed changes. What it changes:
+
+    * ``routes.txt`` — extended ``route_type`` codes folded onto the basic set
+      (see :func:`basic_route_type`); routes with no basic equivalent (air,
+      taxi/on-demand, car, misc) dropped, along with their trips, stop times
+      and frequency entries. A dropped route whose trips stayed would be a
+      ``NullPointerException``: ``TransitLayer.loadFromGtfs`` looks the route up
+      per trip and never checks for null. Blank or dangling ``agency_id``s are
+      repaired for the same reason.
+    * ``stops.txt`` — ``location_type`` 2, 3 and 4 (entrance, generic node,
+      boarding area) dropped. R5 loads them as ordinary stops, and the spec lets
+      them omit coordinates, which would put them at latitude NaN. A row that
+      ``stop_times.txt`` actually references is kept regardless: R5 resolves
+      stop ids through a map that returns index 0 for a miss, so a dangling
+      reference would silently attach trips to the wrong stop.
+    * ``transfers.txt`` — rows referencing a dropped stop removed. Types 4 and
+      5 (in-seat transfers) are left alone: R5's ``GtfsTransferLoader`` counts
+      and skips them, it does not fail.
+
+    Everything else — calendar, calendar_dates, agency, feed_info, shapes,
+    pathways, levels — is copied byte for byte. ``feed_info.txt`` and
+    ``frequencies.txt`` are optional for R5 and need no repair.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"gtfs-r5-v{SANITISER_VERSION}-{file_digest(src_zip)}.zip"
+    if dest.exists():
+        log.info("using cached sanitised GTFS %s (%.0f MB)", dest.name, dest.stat().st_size / 1e6)
+        return dest
+
+    log.info("sanitising %s for R5 -> %s", src_zip.name, dest.name)
+    started = time.monotonic()
+    tmp = dest.with_suffix(".zip.part")
+    with zipfile.ZipFile(src_zip) as src:
+        names = [n for n in src.namelist() if not n.endswith("/")]
+        # compresslevel=1: this zip is a local cache read once by R5, and
+        # stop_times.txt is big enough that deflate time dominates the step.
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as out:
+            dropped_routes = _sanitise_routes(src, out)
+
+            dropped_trips: set[str] = set()
+            kept_trips = 0
+            if "trips.txt" in names:
+                rows = _read_rows(src, "trips.txt")
+                with _member_writer(out, "trips.txt", list(next(rows))) as writer:
+                    for row in rows:
+                        if row.get("route_id") in dropped_routes:
+                            dropped_trips.add(row["trip_id"])
+                            continue
+                        kept_trips += 1
+                        writer.writerow(row)
+
+            used_stops: set[str] = set()
+            dropped_times = kept_times = 0
+            if "stop_times.txt" in names:
+                rows = _read_rows(src, "stop_times.txt")
+                with _member_writer(out, "stop_times.txt", list(next(rows))) as writer:
+                    for row in rows:
+                        if row.get("trip_id") in dropped_trips:
+                            dropped_times += 1
+                            continue
+                        used_stops.add(row["stop_id"])
+                        kept_times += 1
+                        writer.writerow(row)
+
+            dropped_stops: set[str] = set()
+            if "stops.txt" in names:
+                rows = _read_rows(src, "stops.txt")
+                with _member_writer(out, "stops.txt", list(next(rows))) as writer:
+                    for row in rows:
+                        location_type = (row.get("location_type") or "0").strip() or "0"
+                        if location_type not in ("0", "1") and row["stop_id"] not in used_stops:
+                            dropped_stops.add(row["stop_id"])
+                            continue
+                        writer.writerow(row)
+
+            dropped_transfers = 0
+            if "transfers.txt" in names and dropped_stops:
+                rows = _read_rows(src, "transfers.txt")
+                with _member_writer(out, "transfers.txt", list(next(rows))) as writer:
+                    for row in rows:
+                        if row.get("from_stop_id") in dropped_stops or row.get("to_stop_id") in dropped_stops:
+                            dropped_transfers += 1
+                            continue
+                        writer.writerow(row)
+
+            dropped_freqs = 0
+            if "frequencies.txt" in names and dropped_trips:
+                rows = _read_rows(src, "frequencies.txt")
+                with _member_writer(out, "frequencies.txt", list(next(rows))) as writer:
+                    for row in rows:
+                        if row.get("trip_id") in dropped_trips:
+                            dropped_freqs += 1
+                            continue
+                        writer.writerow(row)
+
+            rewritten = set(out.namelist())
+            for name in names:
+                if name in rewritten:
+                    continue
+                # Streamed: shapes.txt alone can be hundreds of megabytes.
+                with src.open(name) as raw, out.open(name, "w") as copy:
+                    shutil.copyfileobj(raw, copy, length=1 << 20)
+
+    tmp.replace(dest)
+    log.info(
+        "sanitised in %.0f s: dropped %d routes, %d trips, %d stop_times rows, "
+        "%d stops, %d transfers, %d frequencies; kept %d trips and %d stop_times rows",
+        time.monotonic() - started, len(dropped_routes), len(dropped_trips), dropped_times,
+        len(dropped_stops), dropped_transfers, dropped_freqs, kept_trips, kept_times,
+    )
+    return dest
+
+
+# --------------------------------------------------------------------------
 # representative dates
 # --------------------------------------------------------------------------
 
@@ -288,8 +553,6 @@ def _is_blackout(day: dt.date) -> bool:
 
 def gtfs_validity(gtfs_zip: Path) -> tuple[dt.date, dt.date]:
     """Overall service window of the feed, from calendar.txt / calendar_dates.txt."""
-    import csv
-    import io
 
     def rows(zf: zipfile.ZipFile, name: str):
         with zf.open(name) as raw:
@@ -562,6 +825,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--time-budget-min", type=float,
                         help="stop cleanly after this many minutes (checkpoints are kept)")
     parser.add_argument("--gtfs", type=Path, default=DOWNLOAD_DIR / "gtfs_ch.zip")
+    parser.add_argument("--gtfs-cache", type=Path, default=GTFS_CACHE_DIR,
+                        help="where the R5-safe copy of the GTFS is kept")
     parser.add_argument("--osm", type=Path, default=DOWNLOAD_DIR / "switzerland-latest.osm.pbf")
     parser.add_argument("--refresh", action="store_true", help="re-download GTFS and OSM")
     parser.add_argument("--max-memory", help="passed to r5py, e.g. '6G' or '80%%'")
@@ -613,6 +878,9 @@ def main(argv: list[str] | None = None) -> int:
     gtfs = download(GTFS_URL, args.gtfs, args.refresh)
     osm = download(OSM_URL, args.osm, args.refresh)
     osm = crop_osm(osm, args.osm.with_name("switzerland-ch-bbox.osm.pbf"), args.refresh)
+    # R5 routes on the sanitised copy; everything else — validity window,
+    # checkpoint directory — keys off the original file.
+    routable_gtfs = sanitise_gtfs(gtfs, args.gtfs_cache)
 
     valid_from, valid_to = gtfs_validity(gtfs)
     dates = pick_dates(valid_from, valid_to, args.today, day_types)
@@ -648,7 +916,7 @@ def main(argv: list[str] | None = None) -> int:
     if not todo:
         log.info("every requested cell is already checkpointed")
     else:
-        network = build_network(osm, gtfs)
+        network = build_network(osm, routable_gtfs)
         destinations = points_frame(stops)
         for day_type, hour, batch in todo:
             if deadline and time.monotonic() > deadline:

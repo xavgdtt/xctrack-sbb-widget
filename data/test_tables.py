@@ -177,3 +177,98 @@ def test_representative_dates_are_the_right_weekdays_and_avoid_holidays():
     assert dates[1] != dt.date(2026, 8, 1)
     assert bt.easter(2026) == dt.date(2026, 4, 5)
     assert dt.date(2026, 8, 1) in bt.ch_holidays(2026)
+
+
+# --------------------------------------------------------------------------
+# GTFS sanitising
+# --------------------------------------------------------------------------
+
+
+def write_gtfs(path, **tables) -> None:
+    """A tiny GTFS zip: ``write_gtfs(p, routes=[header_row, ...])``."""
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, rows in tables.items():
+            zf.writestr(f"{name}.txt", "\n".join(",".join(r) for r in rows) + "\n")
+
+
+def read_member(path, name) -> list[list[str]]:
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        return [line.split(",") for line in zf.read(name).decode().strip().splitlines()]
+
+
+def test_extended_route_types_fold_onto_the_basic_set():
+    # Every block the Swiss feed uses, mapped the way R5's own getTransitModes
+    # would have classified it.
+    assert [bt.basic_route_type(c) for c in (102, 201, 300, 401, 405, 400, 502)] == [2, 3, 2, 1, 12, 2, 1]
+    assert [bt.basic_route_type(c) for c in (704, 800, 900, 1000, 1200, 1300, 1400)] == [3, 11, 0, 4, 4, 6, 7]
+    # Basic codes pass through untouched.
+    assert [bt.basic_route_type(c) for c in (0, 1, 2, 3, 4, 5, 6, 7, 11, 12)] == [0, 1, 2, 3, 4, 5, 6, 7, 11, 12]
+    # No basic equivalent: air, taxi/on-demand, car, "misc", unassigned.
+    assert [bt.basic_route_type(c) for c in (1100, 1500, 1501, 1600, 1700, 9, -1)] == [None] * 7
+
+
+def test_unroutable_routes_take_their_trips_and_stop_times_with_them(tmp_path):
+    src = tmp_path / "gtfs.zip"
+    write_gtfs(
+        src,
+        agency=[["agency_id", "agency_name"], ["a1", "One"], ["a2", "Two"]],
+        routes=[
+            ["route_id", "agency_id", "route_short_name", "route_type"],
+            ["r_rail", "a1", "IC1", "102"],
+            ["r_taxi", "a2", "T", "1500"],
+            ["r_misc", "", "M", "1700"],
+        ],
+        trips=[["route_id", "service_id", "trip_id"],
+               ["r_rail", "s", "t1"], ["r_taxi", "s", "t2"], ["r_misc", "s", "t3"]],
+        stop_times=[["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
+                    ["t1", "08:00:00", "08:00:00", "s1", "1"],
+                    ["t1", "08:10:00", "08:10:00", "s2", "2"],
+                    ["t2", "09:00:00", "09:00:00", "s1", "1"],
+                    ["t3", "10:00:00", "10:00:00", "s2", "1"]],
+        stops=[["stop_id", "stop_name", "stop_lat", "stop_lon", "location_type", "parent_station"],
+               ["s1", "A", "47.0", "8.0", "0", ""],
+               ["s2", "B", "47.1", "8.1", "0", ""],
+               ["s3", "A entrance", "", "", "2", "s1"]],
+        transfers=[["from_stop_id", "to_stop_id", "transfer_type"],
+                   ["s1", "s2", "2"], ["s1", "s3", "4"]],
+        calendar=[["service_id", "monday", "start_date", "end_date"], ["s", "1", "20260101", "20261212"]],
+    )
+
+    out = bt.sanitise_gtfs(src, tmp_path / "cache")
+
+    # The rail route survives with a basic route_type; taxi and misc are gone.
+    assert read_member(out, "routes.txt")[1:] == [["r_rail", "a1", "IC1", "2"]]
+    assert [r[2] for r in read_member(out, "trips.txt")[1:]] == ["t1"]
+    assert [r[0] for r in read_member(out, "stop_times.txt")[1:]] == ["t1", "t1"]
+    # location_type 2 is not a stop R5 can route through, and nothing references it.
+    assert [r[0] for r in read_member(out, "stops.txt")[1:]] == ["s1", "s2"]
+    assert read_member(out, "transfers.txt")[1:] == [["s1", "s2", "2"]]
+    # Untouched tables are copied through.
+    assert read_member(out, "calendar.txt") == read_member(src, "calendar.txt")
+    # Named by the source hash, and reused rather than rebuilt.
+    assert bt.file_digest(src) in out.name
+    assert bt.sanitise_gtfs(src, tmp_path / "cache") == out
+
+
+def test_a_route_with_no_resolvable_agency_gets_one(tmp_path):
+    """RouteInfo dereferences the agency without a null check, so a blank
+    agency_id in a multi-agency feed is a NullPointerException in R5."""
+    src = tmp_path / "gtfs.zip"
+    write_gtfs(
+        src,
+        agency=[["agency_id", "agency_name"], ["a1", "One"], ["a2", "Two"]],
+        routes=[["route_id", "agency_id", "route_type"], ["r1", "", "700"], ["r2", "nope", "900"]],
+        trips=[["route_id", "service_id", "trip_id"], ["r1", "s", "t1"]],
+        stops=[["stop_id", "stop_lat", "stop_lon"], ["s1", "47.0", "8.0"]],
+        stop_times=[["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
+                    ["t1", "08:00:00", "08:00:00", "s1", "1"]],
+    )
+
+    assert read_member(bt.sanitise_gtfs(src, tmp_path / "cache"), "routes.txt")[1:] == [
+        ["r1", "a1", "3"],
+        ["r2", "a1", "0"],
+    ]
